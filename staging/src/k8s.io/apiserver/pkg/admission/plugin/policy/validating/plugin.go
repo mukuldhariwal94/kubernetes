@@ -20,7 +20,7 @@ import (
 	"context"
 	"io"
 	"sync"
-
+	"k8s.io/klog/v2"
 	v1 "k8s.io/api/admissionregistration/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apiserver/pkg/admission"
@@ -79,6 +79,7 @@ var _ admission.ValidationInterface = &Plugin{}
 var _ initializer.WantsExcludedAdmissionResources = &Plugin{}
 
 func NewPlugin(_ io.Reader) *Plugin {
+	klog.Infof(" CUSTOM PATCH: VAP Plugin initialized with memory optimizations");
 	handler := admission.NewHandler(admission.Connect, admission.Create, admission.Delete, admission.Update)
 
 	p := &Plugin{
