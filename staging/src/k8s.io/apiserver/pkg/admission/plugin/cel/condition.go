@@ -88,6 +88,7 @@ func objectToResolveVal(r runtime.Object) (interface{}, error) {
 // errors per evaluation are returned on the Evaluation object
 // runtimeCELCostBudget was added for testing purpose only. Callers should always use const RuntimeCELCostBudget from k8s.io/apiserver/pkg/apis/cel/config.go as input.
 func (c *condition) ForInput(ctx context.Context, versionedAttr *admission.VersionedAttributes, request *admissionv1.AdmissionRequest, inputs OptionalVariableBindings, namespace *v1.Namespace, runtimeCELCostBudget int64) ([]EvaluationResult, int64, error) {
+	klog.Infof("CEL_POLICY_TRACE: [5] condition.ForInput started")
 	// TODO: replace unstructured with ref.Val for CEL variables when native type support is available
 	evaluations := make([]EvaluationResult, len(c.compilationResults))
 	var err error

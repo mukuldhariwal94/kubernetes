@@ -1,0 +1,2 @@
+FROM registry.k8s.io/kube-apiserver:v1.31.0
+COPY _output/local/bin/linux/arm64/kube-apiserver /usr/local/bin/kube-apiserver

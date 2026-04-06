@@ -70,6 +70,7 @@ func (c *dispatcher) Start(ctx context.Context) error {
 
 // Dispatch implements generic.Dispatcher.
 func (c *dispatcher) Dispatch(ctx context.Context, a admission.Attributes, o admission.ObjectInterfaces, hooks []PolicyHook) error {
+	klog.Infof("CEL_POLICY_TRACE: [3] Validating Dispatcher called with %d relevant hooks", len(hooks))
 
 	var deniedDecisions []policyDecisionWithMetadata
 
@@ -210,8 +211,9 @@ func (c *dispatcher) Dispatch(ctx context.Context, a admission.Attributes, o adm
 					}
 				}
 
+				klog.Infof("CEL_POLICY_TRACE: [3a] Triggering CEL Evaluator for policy %s", definition.Name)
 				validationResults = append(validationResults,
-					hook.Evaluator.Validate(
+					hook.GetEvaluator().Validate(
 						ctx,
 						matchResource,
 						versionedAttr,

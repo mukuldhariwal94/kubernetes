@@ -75,6 +75,7 @@ func auditAnnotationEvaluationForError(f v1.FailurePolicyType) PolicyAuditAnnota
 // runtimeCELCostBudget was added for testing purpose only. Callers should always use const RuntimeCELCostBudget from k8s.io/apiserver/pkg/apis/cel/config.go as input.
 
 func (v *validator) Validate(ctx context.Context, matchedResource schema.GroupVersionResource, versionedAttr *admission.VersionedAttributes, versionedParams runtime.Object, namespace *corev1.Namespace, runtimeCELCostBudget int64, authz authorizer.Authorizer) ValidateResult {
+	klog.Infof("CEL_POLICY_TRACE: [4] Validator.Validate started")
 	var f v1.FailurePolicyType
 	if v.failPolicy == nil {
 		f = v1.Fail

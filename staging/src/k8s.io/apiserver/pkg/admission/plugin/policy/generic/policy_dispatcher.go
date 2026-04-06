@@ -58,7 +58,7 @@ type PolicyInvocation[P runtime.Object, B runtime.Object, E Evaluator] struct {
 	Binding B
 
 	// Compiled policy evaluator
-	Evaluator E
+	GetEvaluator func() E
 
 	// Params fetched by the binding to use to evaluate the policy
 	Param runtime.Object
@@ -108,6 +108,7 @@ func (d *policyDispatcher[P, B, E]) Start(ctx context.Context) error {
 // is expected to ignore the result of any policies whose match conditions dont pass.
 // This may be possible to refactor so matchconditions are checked here instead.
 func (d *policyDispatcher[P, B, E]) Dispatch(ctx context.Context, a admission.Attributes, o admission.ObjectInterfaces, hooks []PolicyHook[P, B, E]) error {
+	klog.Infof("CEL_POLICY_TRACE: [2] Generic Dispatcher evaluating %d hooks for %s %s/%s", len(hooks), a.GetKind().Kind, a.GetNamespace(), a.GetName())
 	var relevantHooks []PolicyInvocation[P, B, E]
 	// Construct all the versions we need to call our webhooks
 	versionedAttrAccessor := &versionedAttributeAccessor{
@@ -135,6 +136,7 @@ func (d *policyDispatcher[P, B, E]) Dispatch(ctx context.Context, a admission.At
 	for _, hook := range hooks {
 		policyAccessor := d.newPolicyAccessor(hook.Policy)
 		matches, matchGVR, matchGVK, err := d.matcher.DefinitionMatches(a, o, policyAccessor)
+		klog.Infof("CEL_POLICY_TRACE: [2a] Fast match for policy %s: %v (err: %v)", policyAccessor.GetName(), matches, err)
 		if err != nil {
 			// There was an error evaluating if this policy matches anything.
 			addConfigError(err, policyAccessor, nil)
@@ -189,8 +191,8 @@ func (d *policyDispatcher[P, B, E]) Dispatch(ctx context.Context, a admission.At
 					Binding:   binding,
 					Kind:      matchGVK,
 					Resource:  matchGVR,
-					Param:     param,
-					Evaluator: hook.Evaluator,
+					Param:        param,
+					GetEvaluator: hook.GetEvaluator,
 				})
 			}
 		}

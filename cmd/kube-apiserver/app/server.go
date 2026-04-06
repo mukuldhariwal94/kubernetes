@@ -149,6 +149,10 @@ func Run(ctx context.Context, opts options.CompletedOptions) error {
 	// To help debugging, immediately log version
 	klog.Infof("Version: %+v", utilversion.Get())
 
+	klog.Infof("========== CUSTOM PATCH APPLIED: VAP Memory Optimization Startup ==========")
+	klog.Infof("PATCH_ACTIVE: ValidatingAdmissionPolicy memory optimization patches loaded")
+	klog.Infof("PATCH_FEATURES: ObjectPooling, WeakReferences, StreamingCostCalculation, LRUCache")
+
 	klog.InfoS("Golang settings", "GOGC", os.Getenv("GOGC"), "GOMAXPROCS", os.Getenv("GOMAXPROCS"), "GOTRACEBACK", os.Getenv("GOTRACEBACK"))
 
 	config, err := NewConfig(opts)

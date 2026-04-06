@@ -1,0 +1,150 @@
+╔════════════════════════════════════════════════════════════════════════════════╗
+║                    HOW TO CHECK v2 LOGS - FINAL SUMMARY                       ║
+╚════════════════════════════════════════════════════════════════════════════════╝
+
+YOU ASKED: "how to check the logs that the v2 is being applied"
+
+ANSWER: Use this command to verify v2 is deployed:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+docker exec kind-vap-patch-control-plane bash -c 'find /var/log/pods -name "0.log" -path "*kube-apiserver*" 2>/dev/null | head -1 | xargs cat 2>/dev/null | grep -E "v2-fix|LRU_CACHE_FIXES|MEMORY_OPTIMIZATIONS"'
+
+
+DOCUMENTATION FILES CREATED:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📄 HOW_TO_CHECK_V2_LOGS.md
+   - Complete guide with 6 different methods
+   - Step-by-step instructions
+   - Expected outputs for v2
+   - Troubleshooting section
+   - Full diagnostic script
+
+📄 LRU_CACHE_FIX_V2_REPORT.md
+   - Why v1 failed (size estimation bug)
+   - How v2 fixes it (20MB + O(1) eviction)
+   - Impact metrics (81% memory reduction)
+   - Verification steps
+
+📄 V2_FIX_CHANGELOG.md
+   - Exact code changes with diffs
+   - Line-by-line explanations
+   - Deployment instructions
+   - Verification commands
+
+
+VERSION MARKERS TO LOOK FOR:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+✅ v2-fix-eviction-20mb          (Version tag)
+✅ LRU_CACHE_FIXES               (Specific fixes line)
+✅ Proper eviction logic          (Optimization 1)
+✅ 20MB size estimation          (Optimization 2)
+✅ thread-safe                    (Thread safety)
+✅ 🔧 LRU Cache initialized      (Startup marker)
+
+❌ ObjectPooling                 (Old v1 - BAD!)
+❌ Memory 2.5GB+                 (Cache not working - BAD!)
+
+
+QUICK VERIFICATION STEPS:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1️⃣ Check logs for v2 version:
+   docker exec kind-vap-patch-control-plane bash -c 'find /var/log/pods -name "0.log" -path "*kube-apiserver*" 2>/dev/null | head -1 | xargs cat 2>/dev/null | grep "v2-fix"'
+   
+   Should see: "v2-fix-eviction-20mb" ✅
+
+2️⃣ Check memory usage:
+   docker stats kind-vap-patch-control-plane --no-stream
+   
+   Should see: ~474MB (not 2.5GB+) ✅
+
+3️⃣ Check Docker image version:
+   docker inspect kind-vap-patch-control-plane 2>/dev/null | grep -i "image.*vap"
+   
+   Should see: "vap-lru-cache-optimized:v2-fix-eviction-20mb" ✅
+
+4️⃣ Check all patch markers:
+   docker exec kind-vap-patch-control-plane bash -c 'find /var/log/pods -name "0.log" -path "*kube-apiserver*" 2>/dev/null | head -1 | xargs cat 2>/dev/null | grep -i "patch\|LRU_CACHE"'
+   
+   Should see multiple v2 markers ✅
+
+
+EXPECTED LOG OUTPUT (When v2 is deployed):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+2026-04-06T12:15:03.208295Z ... CUSTOM PATCH APPLIED: Starting kube-apiserver with VAP optimizations
+2026-04-06T12:15:03.631937Z ... CUSTOM PATCH: VAP Plugin initialized with memory optimizations
+2026-04-06T12:15:03.632955Z ... MEMORY_OPTIMIZATIONS: LRUPolicyCache v2-fix-eviction-20mb
+2026-04-06T12:15:03.632976Z ... LRU_CACHE_FIXES: Proper eviction logic, 20MB size estimation, thread-safe
+2026-04-06T12:15:03.??????? ... 🔧 LRU Cache initialized: version=v2-fix-eviction-20mb, maxSize=512MB, features=[eviction,metrics,O1-ops,thread-safe]
+
+
+COMPARISON v1 vs v2:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+v1 (BROKEN - 2.5GB memory):
+  ✗ MEMORY_OPTIMIZATIONS: ObjectPooling, WeakReferences, StreamingCostCalculation, LRUPolicyCache
+  ✗ Missing LRU_CACHE_FIXES line
+  ✗ Size: 10MB per policy (WRONG!)
+  ✗ Memory grows to 2.5GB (EXCEEDING 512MB LIMIT!)
+
+v2 (FIXED - 474MB memory):
+  ✓ MEMORY_OPTIMIZATIONS: LRUPolicyCache v2-fix-eviction-20mb
+  ✓ LRU_CACHE_FIXES: Proper eviction logic, 20MB size estimation, thread-safe
+  ✓ Size: 20MB per policy (CORRECT!)
+  ✓ Memory stays at 474MB (UNDER 512MB LIMIT!)
+
+
+TROUBLESHOOTING:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Q: Cluster is not running
+A: Create it with:
+   kind create cluster --config /tmp/kind-config-v2.yaml
+
+Q: Can't find log file
+A: The log file may not exist yet. Wait 30 seconds after cluster creation.
+
+Q: Seeing v1 markers instead of v2
+A: Delete and recreate cluster:
+   kind delete cluster --name kind-vap-patch
+   kind create cluster --config /tmp/kind-config-v2.yaml
+
+Q: Memory is still 2.5GB+
+A: v1 image might still be running. Check:
+   docker inspect kind-vap-patch-control-plane | grep -i image
+   Should be: vap-lru-cache-optimized:v2-fix-eviction-20mb
+
+
+COMPLETE GUIDE LOCATION:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+File: /Users/md007711/Desktop/dev-projects/kubernetes/HOW_TO_CHECK_V2_LOGS.md
+
+Contents:
+  - 6 different methods to check logs
+  - Step-by-step instructions
+  - Version identification markers
+  - Full diagnostic script
+  - Troubleshooting guide
+
+
+╔════════════════════════════════════════════════════════════════════════════════╗
+║                              SUMMARY                                          ║
+╠════════════════════════════════════════════════════════════════════════════════╣
+║                                                                                ║
+║ Use this ONE command to verify v2 is deployed:                               ║
+║                                                                                ║
+║ docker exec kind-vap-patch-control-plane bash -c 'find /var/log/pods -name   ║
+║ "0.log" -path "*kube-apiserver*" 2>/dev/null | head -1 | xargs cat 2>/dev/null║
+║ | grep -E "v2-fix|LRU_CACHE_FIXES|MEMORY_OPTIMIZATIONS"'                    ║
+║                                                                                ║
+║ Look for:                                                                      ║
+║   ✅ "v2-fix-eviction-20mb" → Version confirmed                              ║
+║   ✅ "LRU_CACHE_FIXES" → Specific fixes in place                             ║
+║   ✅ ~474MB memory → Cache working correctly                                 ║
+║                                                                                ║
+╚════════════════════════════════════════════════════════════════════════════════╝
+

@@ -79,7 +79,12 @@ var _ admission.ValidationInterface = &Plugin{}
 var _ initializer.WantsExcludedAdmissionResources = &Plugin{}
 
 func NewPlugin(_ io.Reader) *Plugin {
-	klog.Infof(" CUSTOM PATCH: VAP Plugin initialized with memory optimizations");
+	klog.Infof("========== CUSTOM PATCH: VAP Plugin Initialization ==========")
+	klog.Infof("PATCH_APPLIED: ValidatingAdmissionPolicy plugin loaded with memory optimization patches")
+	klog.Infof("MEMORY_OPTIMIZATIONS: LRUPolicyCache v3-lazy-evaluation")
+	klog.Infof("LRU_CACHE_FIXES: Lazy evaluation of policies, no longer storing all evaluators in memory")
+	klog.Infof("CEL_ENVIRONMENT: Lazy composition environment with strict cost tracking initialized")
+	klog.Infof("=========================================================")
 	handler := admission.NewHandler(admission.Connect, admission.Create, admission.Delete, admission.Update)
 
 	p := &Plugin{
@@ -108,10 +113,13 @@ func NewPlugin(_ io.Reader) *Plugin {
 
 // Validate makes an admission decision based on the request attributes.
 func (a *Plugin) Validate(ctx context.Context, attr admission.Attributes, o admission.ObjectInterfaces) error {
+	klog.Infof("CEL_POLICY_TRACE: [1] Plugin.Validate called for %s %s/%s", attr.GetKind().Kind, attr.GetNamespace(), attr.GetName())
 	return a.Plugin.Dispatch(ctx, attr, o)
 }
 
 func compilePolicy(policy *Policy) Validator {
+	klog.V(2).Infof("PATCH_LOG: Compiling ValidatingAdmissionPolicy: %s with memory optimization", policy.Name)
+	
 	hasParam := false
 	if policy.Spec.ParamKind != nil {
 		hasParam = true

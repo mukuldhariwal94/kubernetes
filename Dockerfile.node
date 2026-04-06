@@ -1,0 +1,5 @@
+FROM kindest/node:v1.31.0
+COPY _output/local/bin/linux/arm64/kube-apiserver /usr/local/bin/kube-apiserver
+RUN chmod +x /usr/local/bin/kube-apiserver
+# The kube-apiserver in kind is run from a container image, we need to overwrite the binary in the container image or mount it
+# Wait, kindest/node pre-loads images. We can't easily modify the pre-loaded image from a Dockerfile.

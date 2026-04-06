@@ -137,14 +137,15 @@ func (d *dispatcher) dispatchInvocations(
 	// Should loop through invocations, handling possible error and invoking
 	// evaluator to apply patch, also should handle re-invocations
 	for _, invocation := range invocations {
-		if invocation.Evaluator.CompositionEnv != nil {
-			ctx = invocation.Evaluator.CompositionEnv.CreateContext(ctx)
+		evaluator := invocation.GetEvaluator()
+		if evaluator.CompositionEnv != nil {
+			ctx = evaluator.CompositionEnv.CreateContext(ctx)
 		}
-		if len(invocation.Evaluator.Mutators) != len(invocation.Policy.Spec.Mutations) {
+		if len(evaluator.Mutators) != len(invocation.Policy.Spec.Mutations) {
 			// This would be a bug. The compiler should always return exactly as
 			// many evaluators as there are mutations
 			return nil, k8serrors.NewInternalError(fmt.Errorf("expected %v compiled evaluators for policy %v, got %v",
-				len(invocation.Policy.Spec.Mutations), invocation.Policy.Name, len(invocation.Evaluator.Mutators)))
+				len(invocation.Policy.Spec.Mutations), invocation.Policy.Name, len(evaluator.Mutators)))
 		}
 
 		versionedAttr, err := versionedAttributes.VersionedAttribute(invocation.Kind)
@@ -154,8 +155,8 @@ func (d *dispatcher) dispatchInvocations(
 			return nil, k8serrors.NewInternalError(err)
 		}
 
-		if invocation.Evaluator.Matcher != nil {
-			matchResults := invocation.Evaluator.Matcher.Match(ctx, versionedAttr, invocation.Param, authz)
+		if evaluator.Matcher != nil {
+			matchResults := evaluator.Matcher.Match(ctx, versionedAttr, invocation.Param, authz)
 			if matchResults.Error != nil {
 				addConfigError(matchResults.Error, invocation, metav1.StatusReasonInvalid)
 				continue
@@ -186,7 +187,7 @@ func (d *dispatcher) dispatchInvocations(
 				continue
 			}
 
-			patcher := invocation.Evaluator.Mutators[mutationIndex]
+			patcher := evaluator.Mutators[mutationIndex]
 			optionalVariables := cel.OptionalVariableBindings{VersionedParams: invocation.Param, Authorizer: authz}
 			startTime := time.Now()
 			err = d.dispatchOne(ctx, patcher, o, versionedAttr, namespace, invocation.Resource, optionalVariables)

@@ -16,7 +16,11 @@ limitations under the License.
 
 package admission
 
-import "context"
+import (
+	"context"
+
+	"k8s.io/klog/v2"
+)
 
 // chainAdmissionHandler is an instance of admission.NamedHandler that performs admission control using
 // a chain of admission handlers
@@ -50,6 +54,9 @@ func (admissionHandler chainAdmissionHandler) Validate(ctx context.Context, a At
 			continue
 		}
 		if validator, ok := handler.(ValidationInterface); ok {
+			if named, ok := handler.(NamedHandler); ok && named.HandlerName() == "ValidatingAdmissionPolicy" {
+				klog.Infof("CEL_POLICY_TRACE: [0] API Server Admission Chain triggering %s for %s %s/%s", named.HandlerName(), a.GetKind().Kind, a.GetNamespace(), a.GetName())
+			}
 			err := validator.Validate(ctx, a, o)
 			if err != nil {
 				return err

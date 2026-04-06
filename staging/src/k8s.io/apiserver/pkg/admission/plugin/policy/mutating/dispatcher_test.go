@@ -661,7 +661,7 @@ func TestDispatcher(t *testing.T) {
 			for i, h := range tc.policyHooks {
 				tc.policyHooks[i].ParamInformer = paramInformer
 				tc.policyHooks[i].ParamScope = testParamScope{}
-				tc.policyHooks[i].Evaluator = compilePolicy(h.Policy)
+				tc.policyHooks[i].GetEvaluator = func() PolicyEvaluator { return compilePolicy(h.Policy) }
 			}
 
 			dispatcher := NewDispatcher(fakeAuthorizer{}, matcher, tcManager)

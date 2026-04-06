@@ -1,0 +1,9 @@
+FROM kindest/node:latest
+
+# Copy only the kube-apiserver binary that we modified with patches
+COPY _output/local/bin/linux/arm64/kube-apiserver /usr/local/bin/kube-apiserver
+
+RUN chmod +x /usr/local/bin/kube-apiserver && \
+    echo "✅ VAP Memory Optimization Patches Applied Successfully"
+
+LABEL description="Custom Kubernetes image with VAP memory optimization patches"

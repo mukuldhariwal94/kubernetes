@@ -67,8 +67,8 @@ type policySource[P runtime.Object, B runtime.Object, E Evaluator] struct {
 	// Whether the cache of policies is dirty and needs to be recompiled
 	policiesDirty atomic.Bool
 
-	lock             sync.Mutex
-	compiledPolicies map[types.NamespacedName]compiledPolicyEntry[E]
+	lock        sync.Mutex
+	policyCache *LRUPolicyCache
 
 	// Temporary until we use the dynamic informer factory
 	paramsCRDControllers map[schema.GroupVersionKind]*paramInfo
@@ -99,7 +99,7 @@ type PolicyHook[P runtime.Object, B runtime.Object, E Evaluator] struct {
 	ParamInformer informers.GenericInformer
 	ParamScope    meta.RESTScope
 
-	Evaluator          E
+	GetEvaluator       func() E
 	ConfigurationError error
 }
 
@@ -119,7 +119,7 @@ func NewPolicySource[P runtime.Object, B runtime.Object, E Evaluator](
 		compiler:             compiler,
 		policyInformer:       generic.NewInformer[P](policyInformer),
 		bindingInformer:      generic.NewInformer[B](bindingInformer),
-		compiledPolicies:     map[types.NamespacedName]compiledPolicyEntry[E]{},
+		policyCache:          NewLRUPolicyCache(512 * 1024 * 1024),
 		newPolicyAccessor:    newPolicyAccessor,
 		newBindingAccessor:   newBindingAccessor,
 		paramsCRDControllers: map[schema.GroupVersionKind]*paramInfo{},
@@ -349,7 +349,7 @@ func (s *policySource[P, B, E]) calculatePolicyData() ([]PolicyHook[P, B, E], er
 		result = append(result, PolicyHook[P, B, E]{
 			Policy:             policySpec,
 			Bindings:           bindingSpecs,
-			Evaluator:          s.compilePolicyLocked(policySpec),
+			GetEvaluator:       func() E { return s.compilePolicyCached(policySpec) },
 			ParamInformer:      paramInformer,
 			ParamScope:         paramScope,
 			ConfigurationError: configurationError,
@@ -365,9 +365,9 @@ func (s *policySource[P, B, E]) calculatePolicyData() ([]PolicyHook[P, B, E], er
 
 	// Clean up orphaned policies by replacing the old cache of compiled policies
 	// (the map of used policies is updated by `compilePolicy`)
-	for policyKey := range s.compiledPolicies {
+	for _, policyKey := range s.policyCache.Keys() {
 		if _, wasSeen := policiesToBindings[policyKey]; !wasSeen {
-			delete(s.compiledPolicies, policyKey)
+			s.policyCache.Remove(policyKey)
 		}
 	}
 
@@ -467,7 +467,7 @@ func (s *policySource[P, B, E]) getParamInformer(param schema.GroupVersionKind) 
 // the cached evaluator.
 //
 // Must be called under write lock
-func (s *policySource[P, B, E]) compilePolicyLocked(policySpec P) E {
+func (s *policySource[P, B, E]) compilePolicyCached(policySpec P) E {
 	policyMeta, err := meta.Accessor(policySpec)
 	if err != nil {
 		// This should not happen if P, and B have ObjectMeta, but
@@ -482,20 +482,36 @@ func (s *policySource[P, B, E]) compilePolicyLocked(policySpec P) E {
 		Name:      policyMeta.GetName(),
 	}
 
-	compiledPolicy, wasCompiled := s.compiledPolicies[key]
-
-	// If the policy or binding has changed since it was last compiled,
-	// and if there is no configuration error (like a missing param CRD)
-	// then we recompile
-	if !wasCompiled ||
-		compiledPolicy.policyVersion != policyMeta.GetResourceVersion() {
-
-		compiledPolicy = compiledPolicyEntry[E]{
-			policyVersion: policyMeta.GetResourceVersion(),
-			evaluator:     s.compiler(policySpec),
+	// Try to get compiled policy from LRU cache
+	cachedEval, wasCompiled := s.policyCache.Get(key)
+	if wasCompiled {
+		if cachedEntry, ok := cachedEval.(*compiledPolicyEntry[E]); ok {
+			if cachedEntry.policyVersion == policyMeta.GetResourceVersion() {
+				klog.V(3).Infof("CEL cache hit for policy %s/%s, skipping recompilation", key.Namespace, key.Name)
+				return cachedEntry.evaluator
+			}
 		}
-		s.compiledPolicies[key] = compiledPolicy
 	}
+
+	// Cache miss or policy version changed - must recompile
+	klog.V(2).Infof("CEL cache miss for policy %s/%s - recompiling", key.Namespace, key.Name)
+	compiledPolicy := &compiledPolicyEntry[E]{
+		policyVersion: policyMeta.GetResourceVersion(),
+		evaluator:     s.compiler(policySpec),
+	}
+
+	// Estimate size: 20MB per policy (accounting for all 4 CEL programs)
+	// Match conditions: 5-10MB
+	// Validations: 2-5MB
+	// Audit annotations: 1-3MB
+	// Message expressions: 1-2MB
+	estimatedSize := int64(20 * 1024 * 1024)
+	
+	klog.V(2).Infof("CACHE_SIZE_CHECK: Policy %s/%s estimated at %dMB, cache has %dMB/%dMB available", 
+		key.Namespace, key.Name, estimatedSize/(1024*1024), (s.policyCache.maxSizeBytes-s.policyCache.currentSize)/(1024*1024), s.policyCache.maxSizeBytes/(1024*1024))
+
+	// Store in LRU cache (will auto-evict if needed)
+	s.policyCache.Put(key, compiledPolicy, estimatedSize)
 
 	return compiledPolicy.evaluator
 }

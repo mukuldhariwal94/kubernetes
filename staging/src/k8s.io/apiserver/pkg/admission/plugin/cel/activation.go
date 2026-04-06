@@ -33,6 +33,7 @@ import (
 // newActivation creates an activation for CEL admission plugins from the given request, admission chain and
 // variable binding information.
 func newActivation(compositionCtx CompositionContext, versionedAttr *admission.VersionedAttributes, request *admissionv1.AdmissionRequest, inputs OptionalVariableBindings, namespace *v1.Namespace) (*evaluationActivation, error) {
+	klog.Infof("CEL_POLICY_TRACE: [6] newActivation creating CEL variable bindings")
 	oldObjectVal, err := objectToResolveVal(versionedAttr.VersionedOldObject)
 	if err != nil {
 		return nil, fmt.Errorf("failed to prepare oldObject variable for evaluation: %w", err)
@@ -117,6 +118,7 @@ func (a *evaluationActivation) Parent() interpreter.Activation {
 // Evaluate runs a compiled CEL admission plugin expression using the provided activation and CEL
 // runtime cost budget.
 func (a *evaluationActivation) Evaluate(ctx context.Context, compositionCtx CompositionContext, compilationResult CompilationResult, remainingBudget int64) (EvaluationResult, int64, error) {
+	klog.Infof("CEL_POLICY_TRACE: [7] evaluationActivation.Evaluate executing CEL program")
 	var evaluation = EvaluationResult{}
 	if compilationResult.ExpressionAccessor == nil { // in case of placeholder
 		return evaluation, remainingBudget, nil
@@ -140,6 +142,13 @@ func (a *evaluationActivation) Evaluate(ctx context.Context, compositionCtx Comp
 	}
 	t1 := time.Now()
 	evalResult, evalDetails, err := compilationResult.Program.ContextEval(ctx, a)
+	
+	var cost int64 = -1
+	if evalDetails != nil && evalDetails.ActualCost() != nil {
+		cost = int64(*evalDetails.ActualCost())
+	}
+	klog.Infof("CEL_POLICY_TRACE: [8] CEL program evaluated. Cost: %v, Error: %v", cost, err)
+	
 	// budget may be spent due to lazy evaluation of composited variables
 	if compositionCtx != nil {
 		compositionCost := compositionCtx.GetAndResetCost()
