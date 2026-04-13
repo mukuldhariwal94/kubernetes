@@ -18,6 +18,7 @@ package cel
 
 import (
 	"fmt"
+	"runtime"
 
 	"github.com/google/cel-go/cel"
 
@@ -28,6 +29,7 @@ import (
 	"k8s.io/apiserver/pkg/cel/environment"
 	"k8s.io/apiserver/pkg/cel/library"
 	"k8s.io/apiserver/pkg/cel/mutation"
+	"k8s.io/klog/v2"
 )
 
 const (
@@ -165,6 +167,9 @@ type variableDeclEnvs map[OptionalVariableDeclarations]*environment.EnvSet
 // CompileCELExpression returns a compiled CEL expression.
 // perCallLimit was added for testing purpose only. Callers should always use const PerCallLimit from k8s.io/apiserver/pkg/apis/cel/config.go as input.
 func (c compiler) CompileCELExpression(expressionAccessor ExpressionAccessor, options OptionalVariableDeclarations, envType environment.Type) CompilationResult {
+	var memBefore runtime.MemStats
+	runtime.ReadMemStats(&memBefore)
+
 	resultError := func(errorString string, errType apiservercel.ErrorType, cause error) CompilationResult {
 		return CompilationResult{
 			Error: &apiservercel.Error{
@@ -215,6 +220,12 @@ func (c compiler) CompileCELExpression(expressionAccessor ExpressionAccessor, op
 	if err != nil {
 		return resultError("program instantiation failed: "+err.Error(), apiservercel.ErrorTypeInternal, nil)
 	}
+
+	var memAfter runtime.MemStats
+	runtime.ReadMemStats(&memAfter)
+	allocatedBytes := int64(memAfter.Alloc) - int64(memBefore.Alloc)
+	klog.V(2).InfoS("CEL expression compiled successfully", "expression", expressionAccessor.GetExpression(), "memoryUsedBytes", allocatedBytes)
+
 	return CompilationResult{
 		Program:            prog,
 		ExpressionAccessor: expressionAccessor,

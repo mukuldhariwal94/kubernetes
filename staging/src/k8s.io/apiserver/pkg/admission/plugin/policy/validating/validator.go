@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime"
 	"strings"
 
 	celtypes "github.com/google/cel-go/common/types"
@@ -27,7 +28,7 @@ import (
 	v1 "k8s.io/api/admissionregistration/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
+	kuberuntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apiserver/pkg/admission"
 	"k8s.io/apiserver/pkg/admission/plugin/cel"
@@ -74,17 +75,26 @@ func auditAnnotationEvaluationForError(f v1.FailurePolicyType) PolicyAuditAnnota
 // Validate takes a list of Evaluation and a failure policy and converts them into actionable PolicyDecisions
 // runtimeCELCostBudget was added for testing purpose only. Callers should always use const RuntimeCELCostBudget from k8s.io/apiserver/pkg/apis/cel/config.go as input.
 
-func (v *validator) Validate(ctx context.Context, matchedResource schema.GroupVersionResource, versionedAttr *admission.VersionedAttributes, versionedParams runtime.Object, namespace *corev1.Namespace, runtimeCELCostBudget int64, authz authorizer.Authorizer) ValidateResult {
+func (v *validator) Validate(ctx context.Context, matchedResource schema.GroupVersionResource, versionedAttr *admission.VersionedAttributes, versionedParams kuberuntime.Object, namespace *corev1.Namespace, runtimeCELCostBudget int64, authz authorizer.Authorizer) ValidateResult {
+	var memBefore runtime.MemStats
+	runtime.ReadMemStats(&memBefore)
+
 	klog.Infof("CEL_POLICY_TRACE: [4] Validator.Validate started")
+	klog.V(2).InfoS("Validator starting", "resource", matchedResource.String(), "runtimeCostBudget", runtimeCELCostBudget)
+
 	var f v1.FailurePolicyType
 	if v.failPolicy == nil {
 		f = v1.Fail
 	} else {
 		f = *v.failPolicy
 	}
+	klog.V(3).InfoS("Failure policy", "policy", f)
+
 	if v.celMatcher != nil {
+		klog.V(3).InfoS("Evaluating match conditions")
 		matchResults := v.celMatcher.Match(ctx, versionedAttr, versionedParams, authz)
 		if matchResults.Error != nil {
+			klog.V(2).InfoS("Match condition evaluation error", "error", matchResults.Error)
 			return ValidateResult{
 				Decisions: []PolicyDecision{
 					{
@@ -98,8 +108,10 @@ func (v *validator) Validate(ctx context.Context, matchedResource schema.GroupVe
 
 		// if preconditions are not met, then do not return any validations
 		if !matchResults.Matches {
+			klog.V(3).InfoS("Match conditions not met, skipping validation")
 			return ValidateResult{}
 		}
+		klog.V(3).InfoS("Match conditions satisfied, proceeding with validation")
 	}
 
 	optionalVars := cel.OptionalVariableBindings{VersionedParams: versionedParams, Authorizer: authz}
@@ -107,8 +119,11 @@ func (v *validator) Validate(ctx context.Context, matchedResource schema.GroupVe
 	admissionRequest := cel.CreateAdmissionRequest(versionedAttr.Attributes, metav1.GroupVersionResource(matchedResource), metav1.GroupVersionKind(versionedAttr.VersionedKind))
 	// Decide which fields are exposed
 	ns := cel.CreateNamespaceObject(namespace)
+	
+	klog.V(2).InfoS("Starting validation filter evaluation", "runtimeCostBudget", runtimeCELCostBudget)
 	evalResults, remainingBudget, err := v.validationFilter.ForInput(ctx, versionedAttr, admissionRequest, optionalVars, ns, runtimeCELCostBudget)
 	if err != nil {
+		klog.V(2).InfoS("Validation filter evaluation error", "error", err)
 		return ValidateResult{
 			Decisions: []PolicyDecision{
 				{
@@ -119,8 +134,13 @@ func (v *validator) Validate(ctx context.Context, matchedResource schema.GroupVe
 			},
 		}
 	}
+	klog.V(2).InfoS("Validation filter evaluation completed", "resultCount", len(evalResults), "remainingBudget", remainingBudget)
+
 	decisions := make([]PolicyDecision, len(evalResults))
+	klog.V(2).InfoS("Starting message filter evaluation")
 	messageResults, _, err := v.messageFilter.ForInput(ctx, versionedAttr, admissionRequest, expressionOptionalVars, ns, remainingBudget)
+	klog.V(2).InfoS("Message filter evaluation completed", "resultCount", len(messageResults))
+
 	for i, evalResult := range evalResults {
 		var decision = &decisions[i]
 		decision.Elapsed = evalResult.Elapsed
@@ -134,6 +154,8 @@ func (v *validator) Validate(ctx context.Context, matchedResource schema.GroupVe
 			continue
 		}
 
+		klog.V(3).InfoS("Processing validation result", "expressionIndex", i, "expression", validation.Expression, "elapsed", evalResult.Elapsed)
+
 		var messageResult *cel.EvaluationResult
 		if len(messageResults) > i {
 			messageResult = &messageResults[i]
@@ -142,10 +164,12 @@ func (v *validator) Validate(ctx context.Context, matchedResource schema.GroupVe
 			decision.Action = policyDecisionActionForError(f)
 			decision.Evaluation = EvalError
 			decision.Message = evalResult.Error.Error()
+			klog.V(2).InfoS("Validation expression error", "expressionIndex", i, "error", evalResult.Error)
 		} else if errors.Is(err, apiservercel.ErrInternal) || errors.Is(err, apiservercel.ErrOutOfBudget) {
 			decision.Action = policyDecisionActionForError(f)
 			decision.Evaluation = EvalError
 			decision.Message = fmt.Sprintf("failed messageExpression: %s", err)
+			klog.V(2).InfoS("Message expression failed", "expressionIndex", i, "error", err)
 		} else if evalResult.EvalResult != celtypes.True {
 			decision.Action = ActionDeny
 			decision.Evaluation = EvalDeny
@@ -187,15 +211,19 @@ func (v *validator) Validate(ctx context.Context, matchedResource schema.GroupVe
 				message = fmt.Sprintf("failed expression: %v", strings.TrimSpace(validation.Expression))
 			}
 			decision.Message = message
+			klog.V(2).InfoS("Validation denied", "expressionIndex", i, "reason", decision.Reason, "message", message)
 		} else {
 			decision.Action = ActionAdmit
 			decision.Evaluation = EvalAdmit
+			klog.V(3).InfoS("Validation admitted", "expressionIndex", i, "elapsed", evalResult.Elapsed)
 		}
 	}
 
 	options := cel.OptionalVariableBindings{VersionedParams: versionedParams}
+	klog.V(2).InfoS("Starting audit annotation evaluation")
 	auditAnnotationEvalResults, _, err := v.auditAnnotationFilter.ForInput(ctx, versionedAttr, admissionRequest, options, namespace, runtimeCELCostBudget)
 	if err != nil {
+		klog.V(2).InfoS("Audit annotation evaluation error", "error", err)
 		return ValidateResult{
 			Decisions: []PolicyDecision{
 				{
@@ -206,6 +234,7 @@ func (v *validator) Validate(ctx context.Context, matchedResource schema.GroupVe
 			},
 		}
 	}
+	klog.V(2).InfoS("Audit annotation evaluation completed", "resultCount", len(auditAnnotationEvalResults))
 
 	auditAnnotationResults := make([]PolicyAuditAnnotation, len(auditAnnotationEvalResults))
 	for i, evalResult := range auditAnnotationEvalResults {
@@ -224,27 +253,51 @@ func (v *validator) Validate(ctx context.Context, matchedResource schema.GroupVe
 		}
 		auditAnnotationResult.Key = validation.Key
 
+		klog.V(3).InfoS("Processing audit annotation", "annotationIndex", i, "key", validation.Key)
+
 		if evalResult.Error != nil {
 			auditAnnotationResult.Action = auditAnnotationEvaluationForError(f)
 			auditAnnotationResult.Error = evalResult.Error.Error()
+			klog.V(2).InfoS("Audit annotation evaluation error", "annotationIndex", i, "key", validation.Key, "error", evalResult.Error)
 		} else {
 			switch evalResult.EvalResult.Type() {
 			case celtypes.StringType:
 				value := strings.TrimSpace(evalResult.EvalResult.Value().(string))
 				if len(value) == 0 {
 					auditAnnotationResult.Action = AuditAnnotationActionExclude
+					klog.V(3).InfoS("Audit annotation excluded (empty value)", "annotationIndex", i, "key", validation.Key)
 				} else {
 					auditAnnotationResult.Action = AuditAnnotationActionPublish
 					auditAnnotationResult.Value = value
+					klog.V(3).InfoS("Audit annotation published", "annotationIndex", i, "key", validation.Key, "valueLength", len(value))
 				}
 			case celtypes.NullType:
 				auditAnnotationResult.Action = AuditAnnotationActionExclude
+				klog.V(3).InfoS("Audit annotation excluded (null value)", "annotationIndex", i, "key", validation.Key)
 			default:
 				auditAnnotationResult.Action = AuditAnnotationActionError
 				auditAnnotationResult.Error = fmt.Sprintf("valueExpression '%v' resulted in unsupported return type: %v. "+
 					"Return type must be either string or null.", validation.ValueExpression, evalResult.EvalResult.Type())
+				klog.V(2).InfoS("Audit annotation type error", "annotationIndex", i, "key", validation.Key, "resultType", evalResult.EvalResult.Type())
 			}
 		}
 	}
+
+	var memAfter runtime.MemStats
+	runtime.ReadMemStats(&memAfter)
+	allocatedBytes := int64(memAfter.Alloc) - int64(memBefore.Alloc)
+
+	admitCount := 0
+	denyCount := 0
+	for _, d := range decisions {
+		if d.Action == ActionAdmit {
+			admitCount++
+		} else if d.Action == ActionDeny {
+			denyCount++
+		}
+	}
+
+	klog.V(2).InfoS("Validator completed", "decisionCount", len(decisions), "admitCount", admitCount, "denyCount", denyCount, "auditAnnotationCount", len(auditAnnotationResults), "memoryUsedBytes", allocatedBytes)
+
 	return ValidateResult{Decisions: decisions, AuditAnnotations: auditAnnotationResults}
 }

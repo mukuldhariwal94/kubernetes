@@ -34,6 +34,7 @@ import (
 	webhookgeneric "k8s.io/apiserver/pkg/admission/plugin/webhook/generic"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/klog/v2"
 )
 
 // PolicyInvocation is a single policy-binding-param tuple from a Policy Hook

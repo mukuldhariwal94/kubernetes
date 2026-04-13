@@ -126,6 +126,12 @@ type Interface interface {
 	Handles(operation Operation) bool
 }
 
+// NamedHandler is an interface for admission handlers that provide a name
+type NamedHandler interface {
+	// HandlerName returns the name of the admission handler
+	HandlerName() string
+}
+
 type MutationInterface interface {
 	Interface
 

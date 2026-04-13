@@ -71,6 +71,7 @@ func (c *dispatcher) Start(ctx context.Context) error {
 // Dispatch implements generic.Dispatcher.
 func (c *dispatcher) Dispatch(ctx context.Context, a admission.Attributes, o admission.ObjectInterfaces, hooks []PolicyHook) error {
 	klog.Infof("CEL_POLICY_TRACE: [3] Validating Dispatcher called with %d relevant hooks", len(hooks))
+	klog.V(2).InfoS("Validating Dispatcher request details", "operation", a.GetOperation(), "kind", a.GetKind().String(), "namespace", a.GetNamespace(), "name", a.GetName(), "user", a.GetUserInfo().GetName())
 
 	var deniedDecisions []policyDecisionWithMetadata
 
@@ -87,13 +88,16 @@ func (c *dispatcher) Dispatch(ctx context.Context, a admission.Attributes, o adm
 		switch policy {
 		case admissionregistrationv1.Ignore:
 			// TODO: add metrics for ignored error here
+			klog.V(2).InfoS("Configuration error ignored", "policy", definition.Name, "binding", binding.Name, "error", err)
 			return
 		case admissionregistrationv1.Fail:
 			var message string
 			if binding == nil {
 				message = fmt.Errorf("failed to configure policy: %w", err).Error()
+				klog.V(2).InfoS("Configuration error for policy", "policy", definition.Name, "error", err)
 			} else {
 				message = fmt.Errorf("failed to configure binding: %w", err).Error()
+				klog.V(2).InfoS("Configuration error for binding", "policy", definition.Name, "binding", binding.Name, "error", err)
 			}
 			deniedDecisions = append(deniedDecisions, policyDecisionWithMetadata{
 				PolicyDecision: PolicyDecision{
@@ -117,6 +121,10 @@ func (c *dispatcher) Dispatch(ctx context.Context, a admission.Attributes, o adm
 
 	authz := admissionauthorizer.NewCachingAuthorizer(c.authz)
 
+	policyCount := 0
+	bindingCount := 0
+	evaluationCount := 0
+
 	for _, hook := range hooks {
 		// versionedAttributes will be set to non-nil inside of the loop, but
 		// is scoped outside of the param loop so we only convert once. We defer
@@ -128,17 +136,23 @@ func (c *dispatcher) Dispatch(ctx context.Context, a admission.Attributes, o adm
 		matches, matchResource, matchKind, err := c.matcher.DefinitionMatches(a, o, NewValidatingAdmissionPolicyAccessor(definition))
 		if err != nil {
 			// Configuration error.
+			klog.V(2).InfoS("Error matching policy definition", "policy", definition.Name, "error", err)
 			addConfigError(err, definition, nil)
 			continue
 		}
 		if !matches {
 			// Policy definition does not match request
+			klog.V(3).InfoS("Policy definition does not match request", "policy", definition.Name)
 			continue
 		} else if hook.ConfigurationError != nil {
 			// Configuration error.
+			klog.V(2).InfoS("Policy has configuration error", "policy", definition.Name, "error", hook.ConfigurationError)
 			addConfigError(hook.ConfigurationError, definition, nil)
 			continue
 		}
+
+		policyCount++
+		klog.V(2).InfoS("Policy definition matched, processing bindings", "policy", definition.Name, "validationCount", len(definition.Spec.Validations))
 
 		auditAnnotationCollector := newAuditAnnotationCollector()
 		for _, binding := range hook.Bindings {
@@ -147,10 +161,12 @@ func (c *dispatcher) Dispatch(ctx context.Context, a admission.Attributes, o adm
 			matches, err := c.matcher.BindingMatches(a, o, NewValidatingAdmissionPolicyBindingAccessor(binding))
 			if err != nil {
 				// Configuration error.
+				klog.V(2).InfoS("Error matching policy binding", "policy", definition.Name, "binding", binding.Name, "error", err)
 				addConfigError(err, definition, binding)
 				continue
 			}
 			if !matches {
+				klog.V(3).InfoS("Policy binding does not match request", "policy", definition.Name, "binding", binding.Name)
 				continue
 			}
 
@@ -163,6 +179,7 @@ func (c *dispatcher) Dispatch(ctx context.Context, a admission.Attributes, o adm
 			)
 
 			if err != nil {
+				klog.V(2).InfoS("Error collecting parameters", "policy", definition.Name, "binding", binding.Name, "error", err)
 				addConfigError(err, definition, binding)
 				continue
 			} else if versionedAttr == nil && len(params) > 0 {
@@ -171,6 +188,7 @@ func (c *dispatcher) Dispatch(ctx context.Context, a admission.Attributes, o adm
 				va, err := admission.NewVersionedAttributes(a, matchKind, o)
 				if err != nil {
 					wrappedErr := fmt.Errorf("failed to convert object version: %w", err)
+					klog.V(2).InfoS("Error converting object version", "policy", definition.Name, "binding", binding.Name, "error", err)
 					addConfigError(wrappedErr, definition, binding)
 					continue
 				}
@@ -192,10 +210,12 @@ func (c *dispatcher) Dispatch(ctx context.Context, a admission.Attributes, o adm
 			if namespaceName != "" {
 				namespace, err = c.matcher.GetNamespace(ctx, namespaceName)
 				if err != nil {
+					klog.V(2).InfoS("Error getting namespace", "namespace", namespaceName, "error", err)
 					return err
 				}
 			}
 
+			bindingCount++
 			for _, param := range params {
 				var p runtime.Object = param
 				if p != nil && p.GetObjectKind().GroupVersionKind().Empty() {
@@ -211,7 +231,9 @@ func (c *dispatcher) Dispatch(ctx context.Context, a admission.Attributes, o adm
 					}
 				}
 
-				klog.Infof("CEL_POLICY_TRACE: [3a] Triggering CEL Evaluator for policy %s", definition.Name)
+				evaluationCount++
+				klog.Infof("CEL_POLICY_TRACE: [3a] Triggering CEL Evaluator for policy %s binding %s (evaluation %d)", definition.Name, binding.Name, evaluationCount)
+				klog.V(2).InfoS("Evaluating policy with params", "policy", definition.Name, "binding", binding.Name, "paramKind", definition.Spec.ParamKind.Kind, "validationActions", binding.Spec.ValidationActions)
 				validationResults = append(validationResults,
 					hook.GetEvaluator().Validate(
 						ctx,
@@ -230,12 +252,18 @@ func (c *dispatcher) Dispatch(ctx context.Context, a admission.Attributes, o adm
 					switch decision.Action {
 					case ActionAdmit:
 						if decision.Evaluation == EvalError {
+							klog.V(2).InfoS("Validation decision: ADMIT with error", "policy", definition.Name, "binding", binding.Name, "expressionIndex", i, "error", decision.Message)
+							celmetrics.Metrics.ObserveAdmission(ctx, decision.Elapsed, definition.Name, binding.Name, ErrorType(&decision))
+						} else {
+							klog.V(2).InfoS("Validation decision: ADMIT", "policy", definition.Name, "binding", binding.Name, "expressionIndex", i, "elapsed", decision.Elapsed)
 							celmetrics.Metrics.ObserveAdmission(ctx, decision.Elapsed, definition.Name, binding.Name, ErrorType(&decision))
 						}
 					case ActionDeny:
+						klog.V(1).InfoS("Validation decision: DENY", "policy", definition.Name, "binding", binding.Name, "expressionIndex", i, "message", decision.Message, "elapsed", decision.Elapsed)
 						for _, action := range binding.Spec.ValidationActions {
 							switch action {
 							case admissionregistrationv1.Deny:
+								klog.V(1).InfoS("Enforcing DENY action", "policy", definition.Name, "binding", binding.Name)
 								deniedDecisions = append(deniedDecisions, policyDecisionWithMetadata{
 									Definition:     definition,
 									Binding:        binding,
@@ -243,16 +271,20 @@ func (c *dispatcher) Dispatch(ctx context.Context, a admission.Attributes, o adm
 								})
 								celmetrics.Metrics.ObserveRejection(ctx, decision.Elapsed, definition.Name, binding.Name, ErrorType(&decision))
 							case admissionregistrationv1.Audit:
+								klog.V(2).InfoS("Recording AUDIT annotation", "policy", definition.Name, "binding", binding.Name)
 								publishValidationFailureAnnotation(binding, i, decision, versionedAttr)
 								celmetrics.Metrics.ObserveAudit(ctx, decision.Elapsed, definition.Name, binding.Name, ErrorType(&decision))
 							case admissionregistrationv1.Warn:
+								klog.V(2).InfoS("Sending WARN to client", "policy", definition.Name, "binding", binding.Name)
 								warning.AddWarning(ctx, "", fmt.Sprintf("Validation failed for ValidatingAdmissionPolicy '%s' with binding '%s': %s", definition.Name, binding.Name, decision.Message))
 								celmetrics.Metrics.ObserveWarn(ctx, decision.Elapsed, definition.Name, binding.Name, ErrorType(&decision))
 							}
 						}
 					default:
-						return fmt.Errorf("unrecognized evaluation decision '%s' for ValidatingAdmissionPolicyBinding '%s' with ValidatingAdmissionPolicy '%s'",
+						err := fmt.Errorf("unrecognized evaluation decision '%s' for ValidatingAdmissionPolicyBinding '%s' with ValidatingAdmissionPolicy '%s'",
 							decision.Action, binding.Name, definition.Name)
+						klog.Error(err)
+						return err
 					}
 				}
 
@@ -262,9 +294,12 @@ func (c *dispatcher) Dispatch(ctx context.Context, a admission.Attributes, o adm
 						value := auditAnnotation.Value
 						if len(auditAnnotation.Value) > maxAuditAnnotationValueLength {
 							value = value[:maxAuditAnnotationValueLength]
+							klog.V(2).InfoS("Audit annotation value truncated", "policy", definition.Name, "key", auditAnnotation.Key, "originalLength", len(auditAnnotation.Value), "truncatedLength", len(value))
 						}
+						klog.V(3).InfoS("Publishing audit annotation", "policy", definition.Name, "key", auditAnnotation.Key, "value", value)
 						auditAnnotationCollector.add(auditAnnotation.Key, value)
 					case AuditAnnotationActionError:
+						klog.V(1).InfoS("Audit annotation evaluation error", "policy", definition.Name, "error", auditAnnotation.Error)
 						// When failurePolicy=fail, audit annotation errors result in deny
 						d := policyDecisionWithMetadata{
 							Definition: definition,
@@ -279,14 +314,19 @@ func (c *dispatcher) Dispatch(ctx context.Context, a admission.Attributes, o adm
 						deniedDecisions = append(deniedDecisions, d)
 						celmetrics.Metrics.ObserveRejection(ctx, auditAnnotation.Elapsed, definition.Name, binding.Name, ErrorType(&d.PolicyDecision))
 					case AuditAnnotationActionExclude: // skip it
+						klog.V(3).InfoS("Audit annotation excluded", "policy", definition.Name, "key", auditAnnotation.Key)
 					default:
-						return fmt.Errorf("unsupported AuditAnnotation Action: %s", auditAnnotation.Action)
+						err := fmt.Errorf("unsupported AuditAnnotation Action: %s", auditAnnotation.Action)
+						klog.Error(err)
+						return err
 					}
 				}
 			}
 		}
 		auditAnnotationCollector.publish(definition.Name, a)
 	}
+
+	klog.V(2).InfoS("Validating dispatcher summary", "policiesMatched", policyCount, "bindingsMatched", bindingCount, "evaluationsExecuted", evaluationCount, "deniedDecisions", len(deniedDecisions))
 
 	if len(deniedDecisions) > 0 {
 		// TODO: refactor admission.NewForbidden so the name extraction is reusable but the code/reason is customizable
@@ -297,6 +337,7 @@ func (c *dispatcher) Dispatch(ctx context.Context, a admission.Attributes, o adm
 		} else {
 			message = fmt.Sprintf("ValidatingAdmissionPolicy '%s' denied request: %s", deniedDecision.Definition.Name, deniedDecision.Message)
 		}
+		klog.V(1).InfoS("Request denied by validation policy", "policy", deniedDecision.Definition.Name, "binding", deniedDecision.Binding.Name, "message", message)
 		err := admission.NewForbidden(a, errors.New(message)).(*k8serrors.StatusError)
 		reason := deniedDecision.Reason
 		if len(reason) == 0 {
@@ -307,6 +348,7 @@ func (c *dispatcher) Dispatch(ctx context.Context, a admission.Attributes, o adm
 		err.ErrStatus.Details.Causes = append(err.ErrStatus.Details.Causes, metav1.StatusCause{Message: message})
 		return err
 	}
+	klog.V(2).InfoS("Request admitted by all validation policies")
 	return nil
 }
 

@@ -19,15 +19,17 @@ package cel
 import (
 	"context"
 	"reflect"
+	"runtime"
 
 	admissionv1 "k8s.io/api/admission/v1"
 	authenticationv1 "k8s.io/api/authentication/v1"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime"
+	kubruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apiserver/pkg/admission"
 	"k8s.io/apiserver/pkg/cel/environment"
+	"k8s.io/klog/v2"
 )
 
 // conditionCompiler implement the interface ConditionCompiler.
@@ -41,13 +43,24 @@ func NewConditionCompiler(env *environment.EnvSet) ConditionCompiler {
 
 // CompileCondition compiles the cel expressions defined in the ExpressionAccessors into a ConditionEvaluator
 func (c *conditionCompiler) CompileCondition(expressionAccessors []ExpressionAccessor, options OptionalVariableDeclarations, mode environment.Type) ConditionEvaluator {
+	var memBefore runtime.MemStats
+	runtime.ReadMemStats(&memBefore)
+
 	compilationResults := make([]CompilationResult, len(expressionAccessors))
+	totalExpressions := 0
 	for i, expressionAccessor := range expressionAccessors {
 		if expressionAccessor == nil {
 			continue
 		}
+		totalExpressions++
 		compilationResults[i] = c.compiler.CompileCELExpression(expressionAccessor, options, mode)
 	}
+
+	var memAfter runtime.MemStats
+	runtime.ReadMemStats(&memAfter)
+	allocatedBytes := int64(memAfter.Alloc) - int64(memBefore.Alloc)
+	klog.V(2).InfoS("CEL condition compilation completed", "expressionCount", totalExpressions, "totalMemoryUsedBytes", allocatedBytes)
+
 	return NewCondition(compilationResults)
 }
 
@@ -66,14 +79,14 @@ func convertObjectToUnstructured(obj interface{}) (*unstructured.Unstructured, e
 	if obj == nil || reflect.ValueOf(obj).IsNil() {
 		return &unstructured.Unstructured{Object: nil}, nil
 	}
-	ret, err := runtime.DefaultUnstructuredConverter.ToUnstructured(obj)
+	ret, err := kubruntime.DefaultUnstructuredConverter.ToUnstructured(obj)
 	if err != nil {
 		return nil, err
 	}
 	return &unstructured.Unstructured{Object: ret}, nil
 }
 
-func objectToResolveVal(r runtime.Object) (interface{}, error) {
+func objectToResolveVal(r kubruntime.Object) (interface{}, error) {
 	if r == nil || reflect.ValueOf(r).IsNil() {
 		return nil, nil
 	}
@@ -89,6 +102,8 @@ func objectToResolveVal(r runtime.Object) (interface{}, error) {
 // runtimeCELCostBudget was added for testing purpose only. Callers should always use const RuntimeCELCostBudget from k8s.io/apiserver/pkg/apis/cel/config.go as input.
 func (c *condition) ForInput(ctx context.Context, versionedAttr *admission.VersionedAttributes, request *admissionv1.AdmissionRequest, inputs OptionalVariableBindings, namespace *v1.Namespace, runtimeCELCostBudget int64) ([]EvaluationResult, int64, error) {
 	klog.Infof("CEL_POLICY_TRACE: [5] condition.ForInput started")
+	klog.V(2).InfoS("Condition evaluation starting", "expressionCount", len(c.compilationResults), "runtimeCostBudget", runtimeCELCostBudget)
+	
 	// TODO: replace unstructured with ref.Val for CEL variables when native type support is available
 	evaluations := make([]EvaluationResult, len(c.compilationResults))
 	var err error
@@ -96,18 +111,35 @@ func (c *condition) ForInput(ctx context.Context, versionedAttr *admission.Versi
 	// if this activation supports composition, we will need the compositionCtx. It may be nil.
 	compositionCtx, _ := ctx.(CompositionContext)
 
+	klog.V(3).InfoS("Creating activation for variables binding")
 	activation, err := newActivation(compositionCtx, versionedAttr, request, inputs, namespace)
 	if err != nil {
+		klog.V(2).InfoS("Failed to create activation", "error", err)
 		return nil, -1, err
 	}
 
 	remainingBudget := runtimeCELCostBudget
+	successCount := 0
+	errorCount := 0
+	
 	for i, compilationResult := range c.compilationResults {
+		klog.V(3).InfoS("Evaluating compiled expression", "expressionIndex", i)
 		evaluations[i], remainingBudget, err = activation.Evaluate(ctx, compositionCtx, compilationResult, remainingBudget)
 		if err != nil {
+			klog.V(2).InfoS("Expression evaluation error", "expressionIndex", i, "error", err)
 			return nil, -1, err
 		}
+		
+		if evaluations[i].Error != nil {
+			errorCount++
+			klog.V(2).InfoS("Expression evaluation returned error", "expressionIndex", i, "error", evaluations[i].Error)
+		} else {
+			successCount++
+			klog.V(3).InfoS("Expression evaluation succeeded", "expressionIndex", i, "elapsed", evaluations[i].Elapsed, "result", evaluations[i].EvalResult)
+		}
 	}
+
+	klog.V(2).InfoS("Condition evaluation completed", "expressionCount", len(c.compilationResults), "successCount", successCount, "errorCount", errorCount, "remainingBudget", remainingBudget)
 
 	return evaluations, remainingBudget, nil
 }
@@ -172,9 +204,9 @@ func CreateAdmissionRequest(attr admission.Attributes, equivalentGVR metav1.Grou
 		UserInfo:           userInfo,
 		// Leave Object and OldObject unset since we don't provide access to them via request
 		DryRun: &dryRun,
-		Options: runtime.RawExtension{
-			Object: attr.GetOperationOptions(),
-		},
+	Options: kubruntime.RawExtension{
+		Object: attr.GetOperationOptions(),
+	},
 	}
 }
 
