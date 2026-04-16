@@ -1,0 +1,351 @@
+# Kubernetes Issue 131417: ValidatingAdmissionPolicy CEL Memory Usage
+
+Analysis and implementation notes for
+https://github.com/kubernetes/kubernetes/issues/131417.
+
+Reviewed locally on 2026-04-16.
+
+## Issue Summary
+
+The issue reports high kube-apiserver memory growth when many
+`ValidatingAdmissionPolicy` and `ValidatingAdmissionPolicyBinding` objects are
+installed. The reported data shows memory increasing with:
+
+- Number of policy and binding pairs.
+- Number of CEL `validations`.
+- Number of CEL `matchConditions`.
+- Number of bindings per policy, especially for namespace-scoped policies where
+  many bindings differ only by namespace selector.
+
+The issue discussion identified two important pressure points:
+
+- Repeated CEL expressions across many policy objects are compiled independently.
+- Binding-heavy configurations still create avoidable in-memory overhead and
+  require scanning every binding attached to a matched policy at request time.
+
+This patch targets the memory side first:
+
+- Reuse compiled CEL filters across equivalent validating policies.
+- Avoid over-allocating the generic policy hook list for binding-heavy policy
+  sources.
+
+## Current Admission Policy Object Flow
+
+```mermaid
+flowchart TD
+  A[ValidatingAdmissionPolicy created or updated] --> B[Policy informer cache]
+  C[ValidatingAdmissionPolicyBinding created or updated] --> D[Binding informer cache]
+  B --> E[generic policySource marked dirty]
+  D --> E
+  E --> F[refreshPolicies]
+  F --> G[calculatePolicyData]
+  G --> H[List all bindings]
+  H --> I[Group bindings by spec.policyName]
+  I --> J[Fetch referenced policy from policy informer]
+  J --> K[Ensure ParamKind informer if needed]
+  K --> L[Compile policy evaluator]
+  L --> M[Create PolicyHook]
+  M --> N[Atomic hooks list used by admission plugin]
+```
+
+Important files:
+
+- `staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/validating/plugin.go`
+- `staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/generic/policy_source.go`
+- `staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/validating/dispatcher.go`
+- `staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/generic/policy_matcher.go`
+- `staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/condition.go`
+- `staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/composition.go`
+
+## API Request Flow
+
+```mermaid
+flowchart TD
+  R[Request enters kube-apiserver] --> A[Authentication]
+  A --> B[Authorization]
+  B --> C[Mutating admission chain]
+  C --> D[Validating admission chain]
+  D --> E[ValidatingAdmissionPolicy plugin]
+  E --> F[Load current PolicyHooks]
+  F --> G[Loop policy hooks]
+  G --> H[DefinitionMatches]
+  H --> H1[Namespace selector]
+  H1 --> H2[Object selector]
+  H2 --> H3[Exclude resource rules]
+  H3 --> H4[Resource rules and equivalent resource matching]
+  H4 -->|policy does not match| G
+  H4 -->|policy matches| I[Loop bindings for policy]
+  I --> J[BindingMatches]
+  J --> J1[Binding namespace selector]
+  J1 --> J2[Binding object selector]
+  J2 --> J3[Binding resource rules]
+  J3 -->|binding does not match| I
+  J3 -->|binding matches| K[Collect params from ParamRef]
+  K --> L[Create VersionedAttributes when needed]
+  L --> M[Evaluate policy matchConditions CEL]
+  M -->|false| I
+  M -->|true| N[Evaluate validations CEL]
+  N --> O[Evaluate messageExpressions]
+  O --> P[Evaluate auditAnnotations]
+  P --> Q{Decision}
+  Q -->|Admit| I
+  Q -->|Warn| W[Add warning]
+  Q -->|Audit| X[Add audit annotation]
+  Q -->|Deny| Y[Return forbidden StatusError]
+```
+
+## Matching Details
+
+### Policy Definition Matching
+
+`generic.PolicyMatcher.DefinitionMatches` receives the request attributes and a
+policy accessor:
+
+1. Requires `spec.matchConstraints`.
+2. Requires non-nil namespace and object selectors.
+3. Converts the policy constraints into `matching.MatchCriteria`.
+4. Calls `matching.Matcher.Matches`.
+
+`matching.Matcher.Matches` evaluates:
+
+1. Namespace selector.
+2. Object selector.
+3. Exclude resource rules.
+4. Resource rules.
+5. Equivalent resource matching when `matchPolicy: Equivalent`.
+
+The result includes the matched `GroupVersionResource` and
+`GroupVersionKind`, which are later used for object conversion and CEL request
+construction.
+
+### Binding Matching
+
+`generic.PolicyMatcher.BindingMatches` receives a binding accessor:
+
+1. If `spec.matchResources` is nil, the binding matches all requests selected
+   by the policy definition.
+2. Otherwise, it applies namespace selector, object selector, exclude rules, and
+   resource rules through the same `matching.Matcher.Matches` path.
+
+Only matched bindings proceed to parameter resolution and CEL evaluation.
+
+### Parameter Resolution
+
+`generic.CollectParams` resolves params for a matched policy and binding:
+
+1. If the policy has no `paramKind`, CEL receives a single nil param.
+2. If `paramKind` exists and the binding has no `paramRef`, CEL receives a
+   single nil param.
+3. If `paramRef.name` is set, the named param is fetched from the relevant
+   namespace or cluster scope.
+4. If `paramRef.selector` is set, all matching params are listed.
+5. If params are missing and `parameterNotFoundAction: Deny`, the request is
+   rejected.
+
+Each resolved param produces a policy evaluation.
+
+## CEL Compilation Before This Patch
+
+Before this patch, each policy object produced its own compiled CEL evaluator:
+
+```mermaid
+flowchart TD
+  A[Policy object] --> B[compilePolicy]
+  B --> C[NewCompositedCompiler]
+  C --> D[Compile variables]
+  D --> E[Compile matchConditions]
+  E --> F[Compile validations]
+  F --> G[Compile auditAnnotations]
+  G --> H[Compile messageExpressions]
+  H --> I[NewValidator]
+```
+
+Even when many policies had identical CEL expressions, compiled programs were
+not shared across policies.
+
+## CEL Compilation After This Patch
+
+The patch adds a bounded per-plugin compiler cache for validating policies:
+
+```mermaid
+flowchart TD
+  A[Policy object] --> B[policyCompilationCacheKey]
+  B --> C{Cache hit?}
+  C -->|yes| D[Reuse compiledPolicy filters]
+  C -->|no| E[Compile CEL filters]
+  E --> F[Store in bounded LRU cache]
+  D --> G[Create per-policy validator wrapper]
+  F --> G
+  G --> H[Per-policy failurePolicy and matcher identity preserved]
+```
+
+The cache key includes CEL-relevant fields:
+
+- Whether `paramKind` is present.
+- Variables names and expressions.
+- Match condition names and expressions.
+- Validation expression, message, messageExpression, and reason.
+- Audit annotation key and valueExpression.
+
+The cache key intentionally excludes fields that should remain per-policy or do
+not affect compiled CEL:
+
+- Policy name.
+- Resource version.
+- Failure policy.
+- Match constraints.
+- Binding configuration.
+
+## Code Changes
+
+### 1. Add a validating policy compiler cache
+
+File:
+`staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/validating/plugin.go`
+
+New implementation pieces:
+
+- `policyCompiler`
+- `compiledPolicy`
+- `policyCompilationCacheEntry`
+- `policyCompilationCacheKey`
+- `compilePolicyExpressions`
+
+Behavior:
+
+- `NewPlugin` creates one `policyCompiler` for the validating admission plugin.
+- Dynamic informer-based policy source uses `compiler.compile`.
+- Static manifest source also uses the same compiler through
+  `Plugin.policyCompiler`.
+- Equivalent CEL specs reuse shared compiled condition filters.
+- `compiledPolicy.newValidator(policy)` creates a fresh validator wrapper for
+  each policy so policy-local behavior remains intact.
+
+Why the validator wrapper is still per policy:
+
+- `failurePolicy` must remain policy specific.
+- The match-condition matcher records metrics using the policy name, so it must
+  preserve the current policy identity.
+- The compiled CEL filters are the heavy reusable objects.
+
+### 2. Bound the cache
+
+File:
+`staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/validating/plugin.go`
+
+The cache is capped by:
+
+```go
+const maxPolicyCompilationCacheEntries = 10000
+```
+
+Eviction uses least-recently-used behavior through `container/list`. This keeps
+memory bounded while still helping clusters with many repeated policy
+templates.
+
+### 3. Avoid over-allocating hooks by binding count
+
+File:
+`staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/generic/policy_source.go`
+
+Changed:
+
+```go
+result := make([]PolicyHook[P, B, E], 0, len(bindingList))
+```
+
+to:
+
+```go
+result := make([]PolicyHook[P, B, E], 0, len(policiesToBindings))
+```
+
+Reason:
+
+`calculatePolicyData` creates one `PolicyHook` per policy that has bindings,
+not one hook per binding. In a workload with 1,000 policies and 100 bindings per
+policy, the old allocation reserved capacity for 100,000 hooks even though only
+1,000 hooks were appended.
+
+### 4. Add cache tests
+
+File:
+`staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/validating/policy_compiler_test.go`
+
+Tests added:
+
+- Equivalent policies share compiled filters.
+- Policy-specific validation metadata such as message text prevents sharing.
+- FailurePolicy differences reuse compiled filters while preserving per-policy
+  failure policy behavior.
+
+## Expected Impact
+
+This patch should reduce kube-apiserver memory use when many
+`ValidatingAdmissionPolicy` objects repeat the same CEL expressions.
+
+It also removes a direct allocation inefficiency for binding-heavy policy sets.
+
+The patch does not yet add a namespace-selector index for request-time binding
+matching. That remains a separate optimization opportunity for clusters where
+bindings are mostly namespace-specific.
+
+## Verification
+
+Completed locally:
+
+```bash
+git diff --check
+```
+
+Result: passed.
+
+Not completed locally:
+
+```bash
+gofmt -w staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/validating/plugin.go \
+  staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/validating/policy_compiler_test.go \
+  staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/generic/policy_source.go
+
+go test ./staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/validating \
+  ./staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/generic
+```
+
+Reason: the local machine did not have `go` or `gofmt` installed on `PATH`.
+
+## Files To Add For Commit
+
+```bash
+git add \
+  ISSUE_131417_VALIDATING_ADMISSION_POLICY_MEMORY.md \
+  staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/generic/policy_source.go \
+  staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/validating/plugin.go \
+  staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/validating/policy_compiler_test.go
+```
+
+Suggested commit message:
+
+```text
+Reduce CEL compilation memory for validating admission policies
+```
+
+## Suggested PR Summary
+
+This change reduces memory growth for `ValidatingAdmissionPolicy` installations
+with repeated CEL expressions by adding a bounded per-plugin cache of compiled
+validating-policy CEL filters. The cache key is based on CEL-relevant policy
+spec fields, while per-policy failure policy and match-condition metric identity
+are preserved by creating a fresh validator wrapper per policy.
+
+It also fixes an allocation in the generic policy source where hook storage was
+preallocated by binding count even though only one hook is produced per policy.
+
+## Follow-Up Work
+
+Potential follow-ups:
+
+1. Add memory benchmarks that compare repeated-policy CEL compilation before and
+   after this cache.
+2. Add scale tests for many bindings per policy.
+3. Consider indexing bindings by namespace selector patterns for request-time
+   optimization when bindings are namespace-specific.

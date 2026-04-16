@@ -17,7 +17,9 @@ limitations under the License.
 package validating
 
 import (
+	"container/list"
 	"context"
+	"encoding/json"
 	"io"
 	"sync"
 
@@ -71,6 +73,7 @@ type PolicyHook = generic.PolicyHook[*Policy, *PolicyBinding, PolicyEvaluator]
 
 type Plugin struct {
 	*generic.Plugin[PolicyHook]
+	compiler *policyCompiler
 }
 
 var _ admission.Interface = &Plugin{}
@@ -84,10 +87,11 @@ func (a *Plugin) SetManifestLoaders(loaders *initializer.ManifestLoaders) {
 		return
 	}
 	loadFunc := loaders.LoadValidatingPolicyManifests
+	compiler := a.policyCompiler()
 	a.SetStaticSourceFactory(func(manifestsDir string) (generic.ReloadableSource[PolicyHook], error) {
 		staticSource := source.NewStaticPolicySource(manifestsDir, a.GetAPIServerID(),
 			func(p *v1.ValidatingAdmissionPolicy) (Validator, error) {
-				v := compilePolicy(p)
+				v := compiler.compile(p)
 				if err := v.CompileError(); err != nil {
 					return nil, err
 				}
@@ -113,6 +117,7 @@ func NewPlugin(configFile io.Reader) (*Plugin, error) {
 	}
 
 	handler := admission.NewHandler(admission.Connect, admission.Create, admission.Delete, admission.Update)
+	compiler := newPolicyCompiler()
 
 	p := &Plugin{
 		Plugin: generic.NewPlugin(
@@ -123,7 +128,7 @@ func NewPlugin(configFile io.Reader) (*Plugin, error) {
 					f.Admissionregistration().V1().ValidatingAdmissionPolicyBindings().Informer(),
 					NewValidatingAdmissionPolicyAccessor,
 					NewValidatingAdmissionPolicyBindingAccessor,
-					compilePolicy,
+					compiler.compile,
 					f,
 					dynamicClient,
 					restMapper,
@@ -133,6 +138,7 @@ func NewPlugin(configFile io.Reader) (*Plugin, error) {
 				return NewDispatcher(a, generic.NewPolicyMatcher(m))
 			},
 		),
+		compiler: compiler,
 	}
 	p.SetEnabled(true)
 	p.SetStaticManifestsDir(cfg.StaticManifestsDir)
@@ -144,20 +150,107 @@ func (a *Plugin) Validate(ctx context.Context, attr admission.Attributes, o admi
 	return a.Plugin.Dispatch(ctx, attr, o)
 }
 
+func (a *Plugin) policyCompiler() *policyCompiler {
+	if a.compiler == nil {
+		a.compiler = newPolicyCompiler()
+	}
+	return a.compiler
+}
+
+const maxPolicyCompilationCacheEntries = 10000
+
+type policyCompiler struct {
+	lock    sync.Mutex
+	entries map[string]*list.Element
+	order   *list.List
+}
+
+type policyCompilationCacheEntry struct {
+	key      string
+	compiled compiledPolicy
+}
+
+type compiledPolicy struct {
+	validationFilter      cel.ConditionEvaluator
+	matchConditionFilter  cel.ConditionEvaluator
+	auditAnnotationFilter cel.ConditionEvaluator
+	messageFilter         cel.ConditionEvaluator
+	compileError          error
+}
+
+func newPolicyCompiler() *policyCompiler {
+	return &policyCompiler{
+		entries: map[string]*list.Element{},
+		order:   list.New(),
+	}
+}
+
+func (c *policyCompiler) compile(policy *Policy) Validator {
+	key := policyCompilationCacheKey(policy)
+	c.lock.Lock()
+	if elem, ok := c.entries[key]; ok {
+		c.order.MoveToFront(elem)
+		compiled := elem.Value.(*policyCompilationCacheEntry).compiled
+		c.lock.Unlock()
+		return compiled.newValidator(policy)
+	}
+	c.lock.Unlock()
+
+	compiled := compilePolicyExpressions(policy)
+
+	c.lock.Lock()
+	if elem, ok := c.entries[key]; ok {
+		c.order.MoveToFront(elem)
+		compiled = elem.Value.(*policyCompilationCacheEntry).compiled
+	} else {
+		c.entries[key] = c.order.PushFront(&policyCompilationCacheEntry{
+			key:      key,
+			compiled: compiled,
+		})
+		for c.order.Len() > maxPolicyCompilationCacheEntries {
+			oldest := c.order.Back()
+			entry := oldest.Value.(*policyCompilationCacheEntry)
+			delete(c.entries, entry.key)
+			c.order.Remove(oldest)
+		}
+	}
+	c.lock.Unlock()
+
+	return compiled.newValidator(policy)
+}
+
+func (c compiledPolicy) newValidator(policy *Policy) Validator {
+	var matcher matchconditions.Matcher
+	if c.matchConditionFilter != nil {
+		matcher = matchconditions.NewMatcher(c.matchConditionFilter, policy.Spec.FailurePolicy, "policy", "validate", policy.Name)
+	}
+	return NewValidator(
+		c.validationFilter,
+		matcher,
+		c.auditAnnotationFilter,
+		c.messageFilter,
+		policy.Spec.FailurePolicy,
+		c.compileError,
+	)
+}
+
 func compilePolicy(policy *Policy) Validator {
+	return compilePolicyExpressions(policy).newValidator(policy)
+}
+
+func compilePolicyExpressions(policy *Policy) compiledPolicy {
 	hasParam := false
 	if policy.Spec.ParamKind != nil {
 		hasParam = true
 	}
 	optionalVars := cel.OptionalVariableDeclarations{HasParams: hasParam, HasAuthorizer: true}
 	expressionOptionalVars := cel.OptionalVariableDeclarations{HasParams: hasParam, HasAuthorizer: false}
-	failurePolicy := policy.Spec.FailurePolicy
-	var matcher matchconditions.Matcher = nil
+	var matchConditionFilter cel.ConditionEvaluator
 	matchConditions := policy.Spec.MatchConditions
 	compositionEnvTemplate := getCompositionEnvTemplateWithStrictCost()
 	filterCompiler, err := cel.NewCompositedCompiler(compositionEnvTemplate)
 	if err != nil {
-		return NewValidator(nil, nil, nil, nil, failurePolicy, err)
+		return compiledPolicy{compileError: err}
 	}
 	filterCompiler.CompileAndStoreVariables(convertv1beta1Variables(policy.Spec.Variables), optionalVars, environment.StoredExpressions)
 
@@ -166,18 +259,82 @@ func compilePolicy(policy *Policy) Validator {
 		for i := range matchConditions {
 			matchExpressionAccessors[i] = (*matchconditions.MatchCondition)(&matchConditions[i])
 		}
-		matcher = matchconditions.NewMatcher(filterCompiler.CompileCondition(matchExpressionAccessors, optionalVars, environment.StoredExpressions), failurePolicy, "policy", "validate", policy.Name)
+		matchConditionFilter = filterCompiler.CompileCondition(matchExpressionAccessors, optionalVars, environment.StoredExpressions)
 	}
-	res := NewValidator(
-		filterCompiler.CompileCondition(convertv1Validations(policy.Spec.Validations), optionalVars, environment.StoredExpressions),
-		matcher,
-		filterCompiler.CompileCondition(convertv1AuditAnnotations(policy.Spec.AuditAnnotations), optionalVars, environment.StoredExpressions),
-		filterCompiler.CompileCondition(convertv1MessageExpressions(policy.Spec.Validations), expressionOptionalVars, environment.StoredExpressions),
-		failurePolicy,
-		nil,
-	)
+	return compiledPolicy{
+		validationFilter:      filterCompiler.CompileCondition(convertv1Validations(policy.Spec.Validations), optionalVars, environment.StoredExpressions),
+		matchConditionFilter:  matchConditionFilter,
+		auditAnnotationFilter: filterCompiler.CompileCondition(convertv1AuditAnnotations(policy.Spec.AuditAnnotations), optionalVars, environment.StoredExpressions),
+		messageFilter:         filterCompiler.CompileCondition(convertv1MessageExpressions(policy.Spec.Validations), expressionOptionalVars, environment.StoredExpressions),
+	}
+}
 
-	return res
+type policyCompilationKey struct {
+	HasParam         bool                 `json:"hasParam"`
+	Variables        []namedExpressionKey `json:"variables,omitempty"`
+	MatchConditions  []namedExpressionKey `json:"matchConditions,omitempty"`
+	Validations      []validationKey      `json:"validations,omitempty"`
+	AuditAnnotations []auditAnnotationKey `json:"auditAnnotations,omitempty"`
+}
+
+type namedExpressionKey struct {
+	Name       string `json:"name"`
+	Expression string `json:"expression"`
+}
+
+type validationKey struct {
+	Expression        string `json:"expression"`
+	Message           string `json:"message,omitempty"`
+	MessageExpression string `json:"messageExpression,omitempty"`
+	Reason            string `json:"reason,omitempty"`
+}
+
+type auditAnnotationKey struct {
+	Key             string `json:"key"`
+	ValueExpression string `json:"valueExpression"`
+}
+
+func policyCompilationCacheKey(policy *Policy) string {
+	key := policyCompilationKey{
+		HasParam:         policy.Spec.ParamKind != nil,
+		Variables:        make([]namedExpressionKey, 0, len(policy.Spec.Variables)),
+		MatchConditions:  make([]namedExpressionKey, 0, len(policy.Spec.MatchConditions)),
+		Validations:      make([]validationKey, 0, len(policy.Spec.Validations)),
+		AuditAnnotations: make([]auditAnnotationKey, 0, len(policy.Spec.AuditAnnotations)),
+	}
+	for _, variable := range policy.Spec.Variables {
+		key.Variables = append(key.Variables, namedExpressionKey{
+			Name:       variable.Name,
+			Expression: variable.Expression,
+		})
+	}
+	for _, matchCondition := range policy.Spec.MatchConditions {
+		key.MatchConditions = append(key.MatchConditions, namedExpressionKey{
+			Name:       matchCondition.Name,
+			Expression: matchCondition.Expression,
+		})
+	}
+	for _, validation := range policy.Spec.Validations {
+		reason := ""
+		if validation.Reason != nil {
+			reason = string(*validation.Reason)
+		}
+		key.Validations = append(key.Validations, validationKey{
+			Expression:        validation.Expression,
+			Message:           validation.Message,
+			MessageExpression: validation.MessageExpression,
+			Reason:            reason,
+		})
+	}
+	for _, auditAnnotation := range policy.Spec.AuditAnnotations {
+		key.AuditAnnotations = append(key.AuditAnnotations, auditAnnotationKey{
+			Key:             auditAnnotation.Key,
+			ValueExpression: auditAnnotation.ValueExpression,
+		})
+	}
+
+	data, _ := json.Marshal(key)
+	return string(data)
 }
 
 func convertv1Validations(inputValidations []v1.Validation) []cel.ExpressionAccessor {
