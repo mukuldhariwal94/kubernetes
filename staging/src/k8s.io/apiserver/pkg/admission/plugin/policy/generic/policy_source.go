@@ -301,7 +301,7 @@ func (s *policySource[P, B, E]) calculatePolicyData() ([]PolicyHook[P, B, E], er
 		policiesToBindings[policyKey] = append(policiesToBindings[policyKey], bindingSpec)
 	}
 
-	result := make([]PolicyHook[P, B, E], 0, len(bindingList))
+	result := make([]PolicyHook[P, B, E], 0, len(policiesToBindings))
 	usedParams := map[schema.GroupVersionKind]struct{}{}
 	var errs []error
 	for policyKey, bindingSpecs := range policiesToBindings {
