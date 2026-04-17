@@ -34,6 +34,7 @@ import (
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/klog/v2"
 )
 
 const (
@@ -111,6 +112,7 @@ func (a *Plugin) Validate(ctx context.Context, attr admission.Attributes, o admi
 }
 
 func compilePolicy(policy *Policy) Validator {
+	klog.Infof("MD:PATCHED")
 	hasParam := false
 	if policy.Spec.ParamKind != nil {
 		hasParam = true
