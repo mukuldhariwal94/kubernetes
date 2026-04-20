@@ -168,11 +168,23 @@ func compilePolicy(policy *Policy) Validator {
 		}
 		matcher = matchconditions.NewMatcher(filterCompiler.CompileCondition(matchExpressionAccessors, optionalVars, environment.StoredExpressions), failurePolicy, "policy", "validate", policy.Name)
 	}
+	// messageExpression programs are only consumed on the validation-failure
+	// branch, so defer their compilation to the first matching request. For
+	// policies whose validations never fail in steady state this avoids
+	// retaining cel.Program for every messageExpression at refresh time.
+	lazyMessage := newLazyMessageEvaluator(func() cel.ConditionEvaluator {
+		return filterCompiler.CompileCondition(
+			convertv1MessageExpressions(policy.Spec.Validations),
+			expressionOptionalVars,
+			environment.StoredExpressions,
+		)
+	})
+
 	res := NewValidator(
 		filterCompiler.CompileCondition(convertv1Validations(policy.Spec.Validations), optionalVars, environment.StoredExpressions),
 		matcher,
 		filterCompiler.CompileCondition(convertv1AuditAnnotations(policy.Spec.AuditAnnotations), optionalVars, environment.StoredExpressions),
-		filterCompiler.CompileCondition(convertv1MessageExpressions(policy.Spec.Validations), expressionOptionalVars, environment.StoredExpressions),
+		lazyMessage,
 		failurePolicy,
 		nil,
 	)

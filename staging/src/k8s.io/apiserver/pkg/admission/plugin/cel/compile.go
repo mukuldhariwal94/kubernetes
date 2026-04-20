@@ -18,6 +18,7 @@ package cel
 
 import (
 	"fmt"
+	"sync"
 
 	"github.com/google/cel-go/cel"
 
@@ -153,18 +154,86 @@ type Compiler interface {
 }
 
 type compiler struct {
-	varEnvs variableDeclEnvs
+	baseEnv       *environment.EnvSet
+	namespaceType *apiservercel.DeclType
+	requestType   *apiservercel.DeclType
+
+	mu sync.Mutex
+	// varEnvs holds EnvSets keyed by the OptionalVariableDeclarations combination
+	// they were built for. Entries are populated lazily by envFor; VAP only uses
+	// one or two of the eight possible combinations, so eager pre-building wastes
+	// memory (see kubernetes/kubernetes#131417).
+	varEnvs map[OptionalVariableDeclarations]*environment.EnvSet
+	// compileCache memoizes CompileCELExpression results within this compiler
+	// instance. For VAP one compiler is created per policy, so this dedupes
+	// intra-policy duplicates (axis A): the same expression text used as a
+	// matchCondition and again inside a validation compiles exactly once.
+	compileCache map[compileCacheKey]CompilationResult
+}
+
+// compileCacheKey fully determines a CompilationResult: the expression text,
+// the optional variable declarations, and the env type (new vs stored).
+type compileCacheKey struct {
+	expression string
+	options    OptionalVariableDeclarations
+	envType    environment.Type
 }
 
 func NewCompiler(env *environment.EnvSet) Compiler {
-	return &compiler{varEnvs: mustBuildEnvs(env)}
+	return &compiler{
+		baseEnv:       env,
+		namespaceType: BuildNamespaceType(),
+		requestType:   BuildRequestType(),
+		varEnvs:       map[OptionalVariableDeclarations]*environment.EnvSet{},
+		compileCache:  map[compileCacheKey]CompilationResult{},
+	}
 }
 
-type variableDeclEnvs map[OptionalVariableDeclarations]*environment.EnvSet
+// envFor returns (and lazily constructs) the EnvSet for the given options.
+// environment.EnvSet.Extend is an expensive operation; building it on demand
+// avoids paying the cost for options this compiler never sees.
+func (c *compiler) envFor(options OptionalVariableDeclarations) (*environment.EnvSet, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if env, ok := c.varEnvs[options]; ok {
+		return env, nil
+	}
+	env, err := createEnvForOpts(c.baseEnv, c.namespaceType, c.requestType, options)
+	if err != nil {
+		return nil, err
+	}
+	c.varEnvs[options] = env
+	return env, nil
+}
 
 // CompileCELExpression returns a compiled CEL expression.
 // perCallLimit was added for testing purpose only. Callers should always use const PerCallLimit from k8s.io/apiserver/pkg/apis/cel/config.go as input.
-func (c compiler) CompileCELExpression(expressionAccessor ExpressionAccessor, options OptionalVariableDeclarations, envType environment.Type) CompilationResult {
+func (c *compiler) CompileCELExpression(expressionAccessor ExpressionAccessor, options OptionalVariableDeclarations, envType environment.Type) CompilationResult {
+	key := compileCacheKey{
+		expression: expressionAccessor.GetExpression(),
+		options:    options,
+		envType:    envType,
+	}
+	c.mu.Lock()
+	if cached, ok := c.compileCache[key]; ok {
+		c.mu.Unlock()
+		// Re-stamp ExpressionAccessor so callers still see their own accessor
+		// in CompilationErrors() output. Program and OutputType are immutable
+		// after cel-go returns them and are safe to share.
+		cached.ExpressionAccessor = expressionAccessor
+		return cached
+	}
+	c.mu.Unlock()
+
+	result := c.compileUncached(expressionAccessor, options, envType)
+
+	c.mu.Lock()
+	c.compileCache[key] = result
+	c.mu.Unlock()
+	return result
+}
+
+func (c *compiler) compileUncached(expressionAccessor ExpressionAccessor, options OptionalVariableDeclarations, envType environment.Type) CompilationResult {
 	resultError := func(errorString string, errType apiservercel.ErrorType, cause error) CompilationResult {
 		return CompilationResult{
 			Error: &apiservercel.Error{
@@ -176,7 +245,11 @@ func (c compiler) CompileCELExpression(expressionAccessor ExpressionAccessor, op
 		}
 	}
 
-	env, err := c.varEnvs[options].Env(envType)
+	envSet, err := c.envFor(options)
+	if err != nil {
+		return resultError(fmt.Sprintf("unexpected error loading CEL environment: %v", err), apiservercel.ErrorTypeInternal, nil)
+	}
+	env, err := envSet.Env(envType)
 	if err != nil {
 		return resultError(fmt.Sprintf("unexpected error loading CEL environment: %v", err), apiservercel.ErrorTypeInternal, nil)
 	}
@@ -220,32 +293,6 @@ func (c compiler) CompileCELExpression(expressionAccessor ExpressionAccessor, op
 		ExpressionAccessor: expressionAccessor,
 		OutputType:         ast.OutputType(),
 	}
-}
-
-func mustBuildEnvs(baseEnv *environment.EnvSet) variableDeclEnvs {
-	requestType := BuildRequestType()
-	namespaceType := BuildNamespaceType()
-	envs := make(variableDeclEnvs, 8) // since the number of variable combinations is small, pre-build a environment for each
-	for _, hasParams := range []bool{false, true} {
-		for _, hasAuthorizer := range []bool{false, true} {
-			var err error
-			{
-				decl := OptionalVariableDeclarations{HasParams: hasParams, HasAuthorizer: hasAuthorizer}
-				envs[decl], err = createEnvForOpts(baseEnv, namespaceType, requestType, decl)
-				if err != nil {
-					panic(err)
-				}
-			}
-			{
-				decl := OptionalVariableDeclarations{HasParams: hasParams, HasAuthorizer: hasAuthorizer, HasPatchTypes: true}
-				envs[decl], err = createEnvForOpts(baseEnv, namespaceType, requestType, decl)
-				if err != nil {
-					panic(err)
-				}
-			}
-		}
-	}
-	return envs
 }
 
 func createEnvForOpts(baseEnv *environment.EnvSet, namespaceType *apiservercel.DeclType, requestType *apiservercel.DeclType, opts OptionalVariableDeclarations) (*environment.EnvSet, error) {
