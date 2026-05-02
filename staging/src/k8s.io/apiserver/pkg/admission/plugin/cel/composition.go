@@ -19,6 +19,8 @@ package cel
 import (
 	"context"
 	"math"
+	"sort"
+	"strings"
 
 	"github.com/google/cel-go/cel"
 	"github.com/google/cel-go/common/types"
@@ -83,11 +85,19 @@ func NewCompositedCompiler(envSet *environment.EnvSet) (*CompositedCompiler, err
 		compiledVariables: map[string]CompilationResult{},
 	}
 
-	compiler := NewCompiler(state.EnvSet)
-	conditionCompiler := &conditionCompiler{compiler}
-	mutation := &mutatingCompiler{compiler}
+	// Build a cached compiler keyed by the *base* env template (envSet),
+	// not the per-policy newEnvSet. Two CompositedCompilers built from the
+	// same template — i.e. the singleton getCompositionEnvTemplateWithStrictCost()
+	// in production — share entries in the process-wide program cache.
+	// Wire the per-policy variable signature provider so the cache key also
+	// differentiates between policies that declare different variable types.
+	baseCompiler := newCachedCompiler(state.EnvSet, envSet)
+	baseCompiler.variableSigFn = state.variableSignature
+
+	conditionCompiler := &conditionCompiler{baseCompiler}
+	mutation := &mutatingCompiler{baseCompiler}
 	return &CompositedCompiler{
-		Compiler:          compiler,
+		Compiler:          baseCompiler,
 		ConditionCompiler: conditionCompiler,
 		MutatingCompiler:  mutation,
 		state:             state,
@@ -171,6 +181,35 @@ type compositionState struct {
 
 func (c *compositionState) AddField(name string, celType *cel.Type) {
 	c.mapType.Fields[name] = apiservercel.NewDeclField(name, convertCelTypeToDeclType(celType), true, nil, nil)
+}
+
+// variableSignature returns a sorted, deterministic snapshot of the in-scope
+// composition variables of the form "name:typeName\n" repeated for each
+// variable. Used as input to the program cache key so that two policies with
+// different variable declarations don't share compiled programs that
+// reference the variables map.
+func (c *compositionState) variableSignature() string {
+	if len(c.compiledVariables) == 0 {
+		return ""
+	}
+	names := make([]string, 0, len(c.compiledVariables))
+	for n := range c.compiledVariables {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	var b strings.Builder
+	for _, n := range names {
+		b.WriteString(n)
+		b.WriteByte(':')
+		t := c.compiledVariables[n].OutputType
+		if t == nil {
+			b.WriteString("dyn")
+		} else {
+			b.WriteString(t.String())
+		}
+		b.WriteByte('\n')
+	}
+	return b.String()
 }
 
 func (c *compositionState) CreateContext(parent context.Context) CompositionContext {

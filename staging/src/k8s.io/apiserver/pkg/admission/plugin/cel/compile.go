@@ -18,6 +18,7 @@ package cel
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/google/cel-go/cel"
 
@@ -154,17 +155,106 @@ type Compiler interface {
 
 type compiler struct {
 	varEnvs variableDeclEnvs
+	// templateID identifies the env template (e.g. the singleton
+	// `getCompositionEnvTemplateWithStrictCost()`) that this compiler was
+	// derived from. Two compilers built from the same template are
+	// structurally equivalent for compilation purposes, so their compiled
+	// programs are interchangeable and may share cache entries.
+	//
+	// nil means "do not participate in the global program cache" — used by
+	// standalone NewCompiler callers (tests, webhook matchers) where the
+	// env may carry call-site-specific options (e.g. custom CostLimit) that
+	// must not bleed into other compilers' compilation results.
+	templateID *environment.EnvSet
+	// variableSigFn returns a structural signature of the in-scope composition
+	// variables at the time of compilation. It is wired by CompositedCompiler
+	// so that the program cache differentiates two policies whose conditions
+	// reference different variable types. nil for compilers used outside of
+	// the composition path (no "variables" identifier in scope).
+	variableSigFn func() string
 }
 
+// NewCompiler returns a Compiler for the given env. The returned compiler is
+// not connected to the process-wide program cache (use NewCompositedCompiler
+// to opt in via a stable env template).
 func NewCompiler(env *environment.EnvSet) Compiler {
 	return &compiler{varEnvs: mustBuildEnvs(env)}
+}
+
+// newCachedCompiler returns a Compiler that participates in the process-wide
+// program cache. templateID must be a stable identity (typically the singleton
+// env template used to derive env). Internal helper for CompositedCompiler.
+func newCachedCompiler(env *environment.EnvSet, templateID *environment.EnvSet) *compiler {
+	return &compiler{
+		varEnvs:    mustBuildEnvs(env),
+		templateID: templateID,
+	}
 }
 
 type variableDeclEnvs map[OptionalVariableDeclarations]*environment.EnvSet
 
 // CompileCELExpression returns a compiled CEL expression.
 // perCallLimit was added for testing purpose only. Callers should always use const PerCallLimit from k8s.io/apiserver/pkg/apis/cel/config.go as input.
+//
+// Successful compilations are cached process-wide so that policies sharing
+// identical expression text reuse the same compiled cel.Program. The cache
+// key is a structural fingerprint of the expression and its compilation
+// inputs (see computeCompileCacheKey for details).
 func (c compiler) CompileCELExpression(expressionAccessor ExpressionAccessor, options OptionalVariableDeclarations, envType environment.Type) CompilationResult {
+	if expressionAccessor == nil {
+		return CompilationResult{}
+	}
+
+	// Compilers without a stable templateID do not share entries with the
+	// process-wide cache (this preserves correctness for standalone
+	// NewCompiler callers that may provide envs with call-site-specific
+	// program options like custom cost limits).
+	if c.templateID == nil {
+		return c.compileFresh(expressionAccessor, options, envType)
+	}
+
+	expr := expressionAccessor.GetExpression()
+	returnTypes := expressionAccessor.ReturnTypes()
+
+	// Only pay the cost of fetching the variable signature when the expression
+	// can possibly reference composition variables. This keeps the cache key
+	// small (and identical) for the common case of expressions that don't use
+	// the "variables" identifier.
+	var varSig string
+	if c.variableSigFn != nil && strings.Contains(expr, "variables") {
+		varSig = c.variableSigFn()
+	}
+
+	key := computeCompileCacheKey(c.templateID, expr, envType, options, returnTypes, varSig)
+
+	if cached, ok := compileCache().Get(key); ok {
+		if cr, ok := cached.(CompilationResult); ok && cr.Program != nil {
+			recordCacheHit()
+			// Rebind ExpressionAccessor to the caller's instance so downstream
+			// type assertions (e.g. *ValidationCondition, *MatchCondition)
+			// resolve against the right policy's metadata.
+			cr.ExpressionAccessor = expressionAccessor
+			return cr
+		}
+	}
+
+	cr := c.compileFresh(expressionAccessor, options, envType)
+	if cr.Error == nil && cr.Program != nil {
+		// Cache only successful compilations. ExpressionAccessor is omitted
+		// from the cached entry; it is rebound on each cache hit above.
+		compileCache().Add(key, CompilationResult{
+			Program:    cr.Program,
+			OutputType: cr.OutputType,
+		})
+	}
+	recordCacheMiss()
+	return cr
+}
+
+// compileFresh performs the underlying CEL compilation without consulting
+// the program cache. Extracted from the previous body of CompileCELExpression
+// so that the cache wrapper remains tidy.
+func (c compiler) compileFresh(expressionAccessor ExpressionAccessor, options OptionalVariableDeclarations, envType environment.Type) CompilationResult {
 	resultError := func(errorString string, errType apiservercel.ErrorType, cause error) CompilationResult {
 		return CompilationResult{
 			Error: &apiservercel.Error{
