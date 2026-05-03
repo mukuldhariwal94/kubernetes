@@ -1,0 +1,421 @@
+diff --git a/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/composition_cache.go b/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/composition_cache.go
+new file mode 100644
+index 00000000000..2ef48f066e8
+--- /dev/null
++++ b/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/composition_cache.go
+@@ -0,0 +1,210 @@
++/*
++Copyright 2026 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package cel
++
++import (
++	"sort"
++	"strings"
++	"sync/atomic"
++
++	"k8s.io/apiserver/pkg/cel/environment"
++	"k8s.io/utils/lru"
++)
++
++// defaultCompositedCompilerCacheSize bounds how many distinct
++// CompositedCompiler instances are kept process-wide. Each entry holds the
++// 9-env machinery and the compiled variable programs for one structural
++// "compilation profile" (env template + variable declarations + opts).
++//
++// The dominant cost per VAP/MAP today is the per-policy creation of this
++// machinery; capping the cache at 1000 entries comfortably accommodates
++// hundreds of distinct variable signatures while bounding memory.
++const defaultCompositedCompilerCacheSize = 1000
++
++var (
++	// globalCompositedCompilerCache is swapped via atomic.Pointer so callers
++	// can read it lock-free.
++	globalCompositedCompilerCache atomic.Pointer[lru.Cache]
++
++	compositedCompilerCacheHits   atomic.Int64
++	compositedCompilerCacheMisses atomic.Int64
++)
++
++func init() {
++	globalCompositedCompilerCache.Store(lru.New(defaultCompositedCompilerCacheSize))
++}
++
++func compositedCompilerCache() *lru.Cache {
++	return globalCompositedCompilerCache.Load()
++}
++
++// CompositedCompilerCacheStats reports current cache stats.
++type CompositedCompilerCacheStats struct {
++	Size   int
++	Hits   int64
++	Misses int64
++}
++
++// GetCompositedCompilerCacheStats returns current cache stats.
++func GetCompositedCompilerCacheStats() CompositedCompilerCacheStats {
++	return CompositedCompilerCacheStats{
++		Size:   compositedCompilerCache().Len(),
++		Hits:   compositedCompilerCacheHits.Load(),
++		Misses: compositedCompilerCacheMisses.Load(),
++	}
++}
++
++// SetCompositedCompilerCacheSizeForTests replaces the process-wide cache with
++// one of the given size and returns a func that restores the previous one.
++// Test only.
++func SetCompositedCompilerCacheSizeForTests(size int) func() {
++	prev := globalCompositedCompilerCache.Load()
++	prevHits := compositedCompilerCacheHits.Load()
++	prevMisses := compositedCompilerCacheMisses.Load()
++	globalCompositedCompilerCache.Store(lru.New(size))
++	compositedCompilerCacheHits.Store(0)
++	compositedCompilerCacheMisses.Store(0)
++	return func() {
++		globalCompositedCompilerCache.Store(prev)
++		compositedCompilerCacheHits.Store(prevHits)
++		compositedCompilerCacheMisses.Store(prevMisses)
++	}
++}
++
++// compositedCompilerCacheKey identifies a structurally unique
++// CompositedCompiler "shape": the env template plus the variable declarations
++// (and the options under which they're compiled).
++//
++// Two policies that share the same envTemplate, varSig, opts and envType can
++// safely share a CompositedCompiler instance because:
++//   - the underlying *environment.EnvSet, the 9-env matrix, and the variable
++//     programs depend only on these inputs;
++//   - the per-policy work after CompileAndStoreVariables (CompileCondition /
++//     CompileMutatingEvaluator) returns *new* per-call evaluators and never
++//     mutates the shared compositionState.
++//
++// The struct is comparable so it can be used directly as an lru.Cache key.
++type compositedCompilerCacheKey struct {
++	envTemplate *environment.EnvSet
++	varSig      string
++	opts        OptionalVariableDeclarations
++	envType     environment.Type
++}
++
++// GetOrCreateCompositedCompiler returns a process-wide cached *CompositedCompiler
++// initialized with the provided variables already compiled. Callers MUST treat
++// the returned compiler as read-only with respect to variable storage —
++// CompileAndStoreVariables must not be called on it.
++//
++// On a cache hit, the per-policy work of constructing a CompositedCompiler
++// (which performs ~9 expensive env.Extend operations and compiles every
++// variable expression) is entirely skipped. Per-policy condition compilation
++// is unaffected and continues to produce per-call evaluators.
++//
++// envTemplate must be a stable identity — typically the singleton returned by
++// the caller's compilation environment template (e.g.
++// `getCompositionEnvTemplateWithStrictCost()` in the validating plugin).
++func GetOrCreateCompositedCompiler(
++	envTemplate *environment.EnvSet,
++	variables []NamedExpressionAccessor,
++	opts OptionalVariableDeclarations,
++	envType environment.Type,
++) (*CompositedCompiler, error) {
++	key := compositedCompilerCacheKey{
++		envTemplate: envTemplate,
++		varSig:      computeVariableDeclSignature(variables),
++		opts:        opts,
++		envType:     envType,
++	}
++
++	if cached, ok := compositedCompilerCache().Get(key); ok {
++		if cc, ok := cached.(*CompositedCompiler); ok {
++			compositedCompilerCacheHits.Add(1)
++			return cc, nil
++		}
++	}
++
++	cc, err := NewCompositedCompiler(envTemplate)
++	if err != nil {
++		return nil, err
++	}
++	cc.CompileAndStoreVariables(variables, opts, envType)
++	compositedCompilerCache().Add(key, cc)
++	compositedCompilerCacheMisses.Add(1)
++	return cc, nil
++}
++
++// computeVariableDeclSignature returns a deterministic structural fingerprint
++// of a list of variable declarations. Two slices that declare the same set of
++// variables (same names, same expressions) — regardless of declaration order —
++// produce the same signature.
++//
++// We sort by name to make the signature insensitive to user reordering, which
++// would otherwise pessimize the cache.
++func computeVariableDeclSignature(variables []NamedExpressionAccessor) string {
++	if len(variables) == 0 {
++		return ""
++	}
++	type nameExpr struct{ name, expr string }
++	pairs := make([]nameExpr, 0, len(variables))
++	for _, v := range variables {
++		if v == nil {
++			continue
++		}
++		pairs = append(pairs, nameExpr{name: v.GetName(), expr: v.GetExpression()})
++	}
++	sort.Slice(pairs, func(i, j int) bool {
++		if pairs[i].name != pairs[j].name {
++			return pairs[i].name < pairs[j].name
++		}
++		return pairs[i].expr < pairs[j].expr
++	})
++	var b strings.Builder
++	for _, p := range pairs {
++		// Length-prefixed framing protects against name|expr collisions
++		// (e.g. {name:"a", expr:"b|c"} vs {name:"a|b", expr:"c"}).
++		writeStringWithLen(&b, p.name)
++		b.WriteByte('=')
++		writeStringWithLen(&b, p.expr)
++		b.WriteByte('\n')
++	}
++	return b.String()
++}
++
++func writeStringWithLen(b *strings.Builder, s string) {
++	// Write a small prefix so two adjacent fields can't merge into one. We use
++	// a decimal length followed by ':' which is short and human-readable in
++	// debug dumps of the cache key.
++	itoaInto(b, len(s))
++	b.WriteByte(':')
++	b.WriteString(s)
++}
++
++func itoaInto(b *strings.Builder, n int) {
++	if n == 0 {
++		b.WriteByte('0')
++		return
++	}
++	var buf [20]byte
++	i := len(buf)
++	for n > 0 {
++		i--
++		buf[i] = byte('0' + n%10)
++		n /= 10
++	}
++	b.Write(buf[i:])
++}
+diff --git a/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/composition_cache_test.go b/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/composition_cache_test.go
+new file mode 100644
+index 00000000000..a088787922a
+--- /dev/null
++++ b/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/composition_cache_test.go
+@@ -0,0 +1,136 @@
++/*
++Copyright 2026 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package cel
++
++import (
++	"testing"
++
++	celgo "github.com/google/cel-go/cel"
++
++	"k8s.io/apiserver/pkg/cel/environment"
++)
++
++// fakeNamedAccessor is a minimal NamedExpressionAccessor for tests that
++// doesn't drag in the validating package.
++type fakeNamedAccessor struct {
++	name string
++	expr string
++}
++
++func (f *fakeNamedAccessor) GetName() string             { return f.name }
++func (f *fakeNamedAccessor) GetExpression() string       { return f.expr }
++func (f *fakeNamedAccessor) ReturnTypes() []*celgo.Type  { return []*celgo.Type{celgo.AnyType} }
++
++func TestGetOrCreateCompositedCompiler_ReusesAcrossPoliciesWithSameVariables(t *testing.T) {
++	restore := SetCompositedCompilerCacheSizeForTests(64)
++	defer restore()
++
++	envTemplate := environment.MustBaseEnvSet(environment.DefaultCompatibilityVersion())
++	vars := []NamedExpressionAccessor{
++		&fakeNamedAccessor{name: "x", expr: "1"},
++		&fakeNamedAccessor{name: "y", expr: "object.kind"},
++	}
++	opts := OptionalVariableDeclarations{HasParams: false, HasAuthorizer: true}
++
++	c1, err := GetOrCreateCompositedCompiler(envTemplate, vars, opts, environment.StoredExpressions)
++	if err != nil {
++		t.Fatalf("first call errored: %v", err)
++	}
++	c2, err := GetOrCreateCompositedCompiler(envTemplate, vars, opts, environment.StoredExpressions)
++	if err != nil {
++		t.Fatalf("second call errored: %v", err)
++	}
++
++	if c1 != c2 {
++		t.Fatalf("expected the same *CompositedCompiler pointer to be reused, got distinct instances")
++	}
++	if got, want := GetCompositedCompilerCacheStats().Hits, int64(1); got != want {
++		t.Errorf("expected %d hit, got %d", want, got)
++	}
++	if got, want := GetCompositedCompilerCacheStats().Misses, int64(1); got != want {
++		t.Errorf("expected %d miss, got %d", want, got)
++	}
++}
++
++func TestGetOrCreateCompositedCompiler_NoVariablesAllShare(t *testing.T) {
++	restore := SetCompositedCompilerCacheSizeForTests(64)
++	defer restore()
++
++	envTemplate := environment.MustBaseEnvSet(environment.DefaultCompatibilityVersion())
++	opts := OptionalVariableDeclarations{HasAuthorizer: true}
++
++	c1, _ := GetOrCreateCompositedCompiler(envTemplate, nil, opts, environment.StoredExpressions)
++	c2, _ := GetOrCreateCompositedCompiler(envTemplate, []NamedExpressionAccessor{}, opts, environment.StoredExpressions)
++	c3, _ := GetOrCreateCompositedCompiler(envTemplate, nil, opts, environment.StoredExpressions)
++
++	if c1 != c2 || c2 != c3 {
++		t.Errorf("expected all three to share an instance (no variables), got %p %p %p", c1, c2, c3)
++	}
++}
++
++func TestGetOrCreateCompositedCompiler_DifferentVariablesDoNotShare(t *testing.T) {
++	restore := SetCompositedCompilerCacheSizeForTests(64)
++	defer restore()
++
++	envTemplate := environment.MustBaseEnvSet(environment.DefaultCompatibilityVersion())
++	opts := OptionalVariableDeclarations{HasAuthorizer: true}
++
++	a := []NamedExpressionAccessor{&fakeNamedAccessor{name: "x", expr: "1"}}
++	b := []NamedExpressionAccessor{&fakeNamedAccessor{name: "x", expr: "2"}}
++
++	ca, _ := GetOrCreateCompositedCompiler(envTemplate, a, opts, environment.StoredExpressions)
++	cb, _ := GetOrCreateCompositedCompiler(envTemplate, b, opts, environment.StoredExpressions)
++
++	if ca == cb {
++		t.Errorf("expected distinct compilers for differing variable expressions; got %p == %p", ca, cb)
++	}
++}
++
++func TestGetOrCreateCompositedCompiler_OrderInsensitiveVariables(t *testing.T) {
++	restore := SetCompositedCompilerCacheSizeForTests(64)
++	defer restore()
++
++	envTemplate := environment.MustBaseEnvSet(environment.DefaultCompatibilityVersion())
++	opts := OptionalVariableDeclarations{HasAuthorizer: true}
++
++	abc := []NamedExpressionAccessor{
++		&fakeNamedAccessor{name: "a", expr: "1"},
++		&fakeNamedAccessor{name: "b", expr: "2"},
++	}
++	bac := []NamedExpressionAccessor{
++		&fakeNamedAccessor{name: "b", expr: "2"},
++		&fakeNamedAccessor{name: "a", expr: "1"},
++	}
++
++	c1, _ := GetOrCreateCompositedCompiler(envTemplate, abc, opts, environment.StoredExpressions)
++	c2, _ := GetOrCreateCompositedCompiler(envTemplate, bac, opts, environment.StoredExpressions)
++	if c1 != c2 {
++		t.Errorf("variable order should not affect compiler identity, got %p != %p", c1, c2)
++	}
++}
++
++func TestGetOrCreateCompositedCompiler_DifferentOptsDoNotShare(t *testing.T) {
++	restore := SetCompositedCompilerCacheSizeForTests(64)
++	defer restore()
++
++	envTemplate := environment.MustBaseEnvSet(environment.DefaultCompatibilityVersion())
++	c1, _ := GetOrCreateCompositedCompiler(envTemplate, nil, OptionalVariableDeclarations{HasParams: false}, environment.StoredExpressions)
++	c2, _ := GetOrCreateCompositedCompiler(envTemplate, nil, OptionalVariableDeclarations{HasParams: true}, environment.StoredExpressions)
++	if c1 == c2 {
++		t.Errorf("expected distinct compilers for different OptionalVariableDeclarations, got %p == %p", c1, c2)
++	}
++}
+diff --git a/staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/mutating/compilation.go b/staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/mutating/compilation.go
+index a0772aab441..361460ce4aa 100644
+--- a/staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/mutating/compilation.go
++++ b/staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/mutating/compilation.go
+@@ -35,7 +35,18 @@ import (
+ // returned is a PolicyEvaluator in the same order as the mutations appeared in the policy.
+ func compilePolicy(policy *v1.MutatingAdmissionPolicy) PolicyEvaluator {
+ 	opts := plugincel.OptionalVariableDeclarations{HasParams: policy.Spec.ParamKind != nil, HasAuthorizer: true}
+-	compiler, err := plugincel.NewCompositedCompiler(environment.MustBaseEnvSet(environment.DefaultCompatibilityVersion()))
++	// Reuse a process-wide CompositedCompiler when another MAP with the same
++	// env template, variable declarations, and compilation options has
++	// already constructed one. This eliminates the per-policy cost of
++	// extending the env, building the 8-env matrix, and compiling identical
++	// variable expressions across mutating policies that share the same
++	// variable shape.
++	compiler, err := plugincel.GetOrCreateCompositedCompiler(
++		environment.MustBaseEnvSet(environment.DefaultCompatibilityVersion()),
++		convertV1Variables(policy.Spec.Variables),
++		opts,
++		environment.StoredExpressions,
++	)
+ 	if err != nil {
+ 		return PolicyEvaluator{Error: &apiservercel.Error{
+ 			Type:   apiservercel.ErrorTypeInternal,
+@@ -43,9 +54,6 @@ func compilePolicy(policy *v1.MutatingAdmissionPolicy) PolicyEvaluator {
+ 		}}
+ 	}
+ 
+-	// Compile and store variables
+-	compiler.CompileAndStoreVariables(convertV1Variables(policy.Spec.Variables), opts, environment.StoredExpressions)
+-
+ 	// Compile matchers
+ 	var matcher matchconditions.Matcher = nil
+ 	matchConditions := policy.Spec.MatchConditions
+diff --git a/staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/validating/plugin.go b/staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/validating/plugin.go
+index 348ecde2d0e..101fc8f5bc6 100644
+--- a/staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/validating/plugin.go
++++ b/staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/validating/plugin.go
+@@ -155,11 +155,22 @@ func compilePolicy(policy *Policy) Validator {
+ 	var matcher matchconditions.Matcher = nil
+ 	matchConditions := policy.Spec.MatchConditions
+ 	compositionEnvTemplate := getCompositionEnvTemplateWithStrictCost()
+-	filterCompiler, err := cel.NewCompositedCompiler(compositionEnvTemplate)
++	// Reuse a process-wide CompositedCompiler when another policy with the
++	// same env template, variable declarations, and compilation options has
++	// already constructed one. This eliminates the per-policy cost of
++	// extending the env, building the 8-env matrix, and compiling identical
++	// variable expressions. The returned compiler is treated as read-only:
++	// per-policy condition evaluators are constructed below without mutating
++	// its compositionState.
++	filterCompiler, err := cel.GetOrCreateCompositedCompiler(
++		compositionEnvTemplate,
++		convertv1beta1Variables(policy.Spec.Variables),
++		optionalVars,
++		environment.StoredExpressions,
++	)
+ 	if err != nil {
+ 		return NewValidator(nil, nil, nil, nil, failurePolicy, err)
+ 	}
+-	filterCompiler.CompileAndStoreVariables(convertv1beta1Variables(policy.Spec.Variables), optionalVars, environment.StoredExpressions)
+ 
+ 	if len(matchConditions) > 0 {
+ 		matchExpressionAccessors := make([]cel.ExpressionAccessor, len(matchConditions))

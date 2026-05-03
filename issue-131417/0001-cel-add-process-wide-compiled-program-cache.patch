@@ -1,0 +1,562 @@
+diff --git a/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/compile.go b/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/compile.go
+index fb5dd825227..a4d102e138a 100644
+--- a/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/compile.go
++++ b/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/compile.go
+@@ -18,6 +18,7 @@ package cel
+ 
+ import (
+ 	"fmt"
++	"strings"
+ 
+ 	"github.com/google/cel-go/cel"
+ 
+@@ -154,17 +155,106 @@ type Compiler interface {
+ 
+ type compiler struct {
+ 	varEnvs variableDeclEnvs
++	// templateID identifies the env template (e.g. the singleton
++	// `getCompositionEnvTemplateWithStrictCost()`) that this compiler was
++	// derived from. Two compilers built from the same template are
++	// structurally equivalent for compilation purposes, so their compiled
++	// programs are interchangeable and may share cache entries.
++	//
++	// nil means "do not participate in the global program cache" — used by
++	// standalone NewCompiler callers (tests, webhook matchers) where the
++	// env may carry call-site-specific options (e.g. custom CostLimit) that
++	// must not bleed into other compilers' compilation results.
++	templateID *environment.EnvSet
++	// variableSigFn returns a structural signature of the in-scope composition
++	// variables at the time of compilation. It is wired by CompositedCompiler
++	// so that the program cache differentiates two policies whose conditions
++	// reference different variable types. nil for compilers used outside of
++	// the composition path (no "variables" identifier in scope).
++	variableSigFn func() string
+ }
+ 
++// NewCompiler returns a Compiler for the given env. The returned compiler is
++// not connected to the process-wide program cache (use NewCompositedCompiler
++// to opt in via a stable env template).
+ func NewCompiler(env *environment.EnvSet) Compiler {
+ 	return &compiler{varEnvs: mustBuildEnvs(env)}
+ }
+ 
++// newCachedCompiler returns a Compiler that participates in the process-wide
++// program cache. templateID must be a stable identity (typically the singleton
++// env template used to derive env). Internal helper for CompositedCompiler.
++func newCachedCompiler(env *environment.EnvSet, templateID *environment.EnvSet) *compiler {
++	return &compiler{
++		varEnvs:    mustBuildEnvs(env),
++		templateID: templateID,
++	}
++}
++
+ type variableDeclEnvs map[OptionalVariableDeclarations]*environment.EnvSet
+ 
+ // CompileCELExpression returns a compiled CEL expression.
+ // perCallLimit was added for testing purpose only. Callers should always use const PerCallLimit from k8s.io/apiserver/pkg/apis/cel/config.go as input.
++//
++// Successful compilations are cached process-wide so that policies sharing
++// identical expression text reuse the same compiled cel.Program. The cache
++// key is a structural fingerprint of the expression and its compilation
++// inputs (see computeCompileCacheKey for details).
+ func (c compiler) CompileCELExpression(expressionAccessor ExpressionAccessor, options OptionalVariableDeclarations, envType environment.Type) CompilationResult {
++	if expressionAccessor == nil {
++		return CompilationResult{}
++	}
++
++	// Compilers without a stable templateID do not share entries with the
++	// process-wide cache (this preserves correctness for standalone
++	// NewCompiler callers that may provide envs with call-site-specific
++	// program options like custom cost limits).
++	if c.templateID == nil {
++		return c.compileFresh(expressionAccessor, options, envType)
++	}
++
++	expr := expressionAccessor.GetExpression()
++	returnTypes := expressionAccessor.ReturnTypes()
++
++	// Only pay the cost of fetching the variable signature when the expression
++	// can possibly reference composition variables. This keeps the cache key
++	// small (and identical) for the common case of expressions that don't use
++	// the "variables" identifier.
++	var varSig string
++	if c.variableSigFn != nil && strings.Contains(expr, "variables") {
++		varSig = c.variableSigFn()
++	}
++
++	key := computeCompileCacheKey(c.templateID, expr, envType, options, returnTypes, varSig)
++
++	if cached, ok := compileCache().Get(key); ok {
++		if cr, ok := cached.(CompilationResult); ok && cr.Program != nil {
++			recordCacheHit()
++			// Rebind ExpressionAccessor to the caller's instance so downstream
++			// type assertions (e.g. *ValidationCondition, *MatchCondition)
++			// resolve against the right policy's metadata.
++			cr.ExpressionAccessor = expressionAccessor
++			return cr
++		}
++	}
++
++	cr := c.compileFresh(expressionAccessor, options, envType)
++	if cr.Error == nil && cr.Program != nil {
++		// Cache only successful compilations. ExpressionAccessor is omitted
++		// from the cached entry; it is rebound on each cache hit above.
++		compileCache().Add(key, CompilationResult{
++			Program:    cr.Program,
++			OutputType: cr.OutputType,
++		})
++	}
++	recordCacheMiss()
++	return cr
++}
++
++// compileFresh performs the underlying CEL compilation without consulting
++// the program cache. Extracted from the previous body of CompileCELExpression
++// so that the cache wrapper remains tidy.
++func (c compiler) compileFresh(expressionAccessor ExpressionAccessor, options OptionalVariableDeclarations, envType environment.Type) CompilationResult {
+ 	resultError := func(errorString string, errType apiservercel.ErrorType, cause error) CompilationResult {
+ 		return CompilationResult{
+ 			Error: &apiservercel.Error{
+diff --git a/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/compile_cache.go b/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/compile_cache.go
+new file mode 100644
+index 00000000000..e0453607ad5
+--- /dev/null
++++ b/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/compile_cache.go
+@@ -0,0 +1,194 @@
++/*
++Copyright 2026 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package cel
++
++import (
++	"crypto/sha256"
++	"encoding/binary"
++	"reflect"
++	"sort"
++	"strings"
++	"sync/atomic"
++
++	"github.com/google/cel-go/cel"
++
++	"k8s.io/apiserver/pkg/cel/environment"
++	"k8s.io/utils/lru"
++)
++
++// reflectPointer returns the numeric identity of the given pointer using
++// reflect (no unsafe).
++func reflectPointer(p *environment.EnvSet) uintptr {
++	return reflect.ValueOf(p).Pointer()
++}
++
++// defaultCompileCacheSize bounds how many distinct compiled CEL programs are
++// kept in the process-wide cache. Each entry holds one cel.Program (typically
++// 30-200 KB), so 5000 entries cap the cache footprint at a few hundred MB
++// even on pathological clusters.
++const defaultCompileCacheSize = 5000
++
++var (
++	// globalCompileCache is swapped via atomic.Pointer so the hot path of
++	// CompileCELExpression is lock-free.
++	globalCompileCache atomic.Pointer[lru.Cache]
++
++	compileCacheHits   atomic.Int64
++	compileCacheMisses atomic.Int64
++)
++
++func init() {
++	globalCompileCache.Store(lru.New(defaultCompileCacheSize))
++}
++
++// compileCache returns the current process-wide compile cache.
++func compileCache() *lru.Cache {
++	return globalCompileCache.Load()
++}
++
++// CompileCacheStats reports current stats from the global compile cache.
++// Exposed for metrics wiring and tests.
++type CompileCacheStats struct {
++	Size   int
++	Hits   int64
++	Misses int64
++}
++
++// GetCompileCacheStats returns current cache stats.
++func GetCompileCacheStats() CompileCacheStats {
++	return CompileCacheStats{
++		Size:   compileCache().Len(),
++		Hits:   compileCacheHits.Load(),
++		Misses: compileCacheMisses.Load(),
++	}
++}
++
++// SetCompileCacheSizeForTests replaces the process-wide cache with one of the
++// requested size and returns a function that restores the previous cache and
++// counters. Test only.
++func SetCompileCacheSizeForTests(size int) func() {
++	prev := globalCompileCache.Load()
++	prevHits := compileCacheHits.Load()
++	prevMisses := compileCacheMisses.Load()
++	globalCompileCache.Store(lru.New(size))
++	compileCacheHits.Store(0)
++	compileCacheMisses.Store(0)
++	return func() {
++		globalCompileCache.Store(prev)
++		compileCacheHits.Store(prevHits)
++		compileCacheMisses.Store(prevMisses)
++	}
++}
++
++// compileCacheKey is a fixed-size structural hash of every input that affects
++// a compiled CEL Program. Using a fixed-size byte array keeps the LRU map
++// efficient.
++type compileCacheKey [sha256.Size]byte
++
++// computeCompileCacheKey produces a stable, collision-resistant key for the
++// cache. The key incorporates every input that can change the compiled output:
++//
++//   - the env template identity (so compilers built from different env
++//     templates — e.g. one with a custom cel.CostLimit — never share entries)
++//   - normalized expression source (whitespace-trimmed)
++//   - environment Type (NewExpressions vs StoredExpressions)
++//   - OptionalVariableDeclarations (HasParams, HasAuthorizer, HasPatchTypes)
++//   - sorted list of allowed return types from the ExpressionAccessor
++//   - sorted "name:type" snapshot of in-scope composition variables
++//
++// All inputs are length-prefixed before hashing to avoid collisions caused by
++// adjacent fields concatenating into the same byte sequence.
++func computeCompileCacheKey(
++	templateID *environment.EnvSet,
++	expr string,
++	envType environment.Type,
++	opts OptionalVariableDeclarations,
++	returnTypes []*cel.Type,
++	varSig string,
++) compileCacheKey {
++	h := sha256.New()
++	writeLP := func(b []byte) {
++		var lenBuf [8]byte
++		binary.BigEndian.PutUint64(lenBuf[:], uint64(len(b)))
++		_, _ = h.Write(lenBuf[:])
++		_, _ = h.Write(b)
++	}
++
++	// The templateID pointer disambiguates compilations performed with
++	// different env templates (different program options, libraries, etc.).
++	var idBuf [8]byte
++	binary.BigEndian.PutUint64(idBuf[:], uint64(templateIDValue(templateID)))
++	writeLP(idBuf[:])
++
++	writeLP([]byte(normalizeExpression(expr)))
++	writeLP([]byte(envType))
++
++	var optsBits byte
++	if opts.HasParams {
++		optsBits |= 1
++	}
++	if opts.HasAuthorizer {
++		optsBits |= 2
++	}
++	if opts.HasPatchTypes {
++		optsBits |= 4
++	}
++	writeLP([]byte{optsBits})
++
++	rts := make([]string, 0, len(returnTypes))
++	for _, t := range returnTypes {
++		if t == nil {
++			rts = append(rts, "")
++			continue
++		}
++		rts = append(rts, t.String())
++	}
++	sort.Strings(rts)
++	for _, rt := range rts {
++		writeLP([]byte(rt))
++	}
++
++	writeLP([]byte(varSig))
++
++	var out compileCacheKey
++	copy(out[:], h.Sum(nil))
++	return out
++}
++
++// normalizeExpression performs conservative normalization on an expression
++// string for the purposes of cache-key computation only. Internal whitespace
++// is intentionally preserved because changing it could shift error spans
++// surfaced by cel-go.
++func normalizeExpression(expr string) string {
++	return strings.TrimSpace(expr)
++}
++
++// recordCacheHit and recordCacheMiss are inlined-friendly counter bumps used
++// by compiler.CompileCELExpression. They are exposed via GetCompileCacheStats.
++func recordCacheHit()  { compileCacheHits.Add(1) }
++func recordCacheMiss() { compileCacheMisses.Add(1) }
++
++// templateIDValue extracts a numeric identity for a *environment.EnvSet pointer
++// without importing unsafe. Two equal pointers yield equal values; nil yields 0.
++func templateIDValue(p *environment.EnvSet) uintptr {
++	if p == nil {
++		return 0
++	}
++	// reflect.ValueOf(p).Pointer() is the standard, unsafe-free way to obtain
++	// a pointer's numeric identity.
++	return reflectPointer(p)
++}
+diff --git a/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/compile_cache_test.go b/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/compile_cache_test.go
+new file mode 100644
+index 00000000000..ee8a1f0cf4b
+--- /dev/null
++++ b/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/compile_cache_test.go
+@@ -0,0 +1,164 @@
++/*
++Copyright 2026 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package cel
++
++import (
++	"testing"
++
++	celgo "github.com/google/cel-go/cel"
++
++	"k8s.io/apiserver/pkg/cel/environment"
++)
++
++// fakeAccessor is a minimal ExpressionAccessor for tests that doesn't drag in
++// the validating package.
++type fakeAccessor struct {
++	expr     string
++	rt       []*celgo.Type
++	identity string
++}
++
++func (f *fakeAccessor) GetExpression() string    { return f.expr }
++func (f *fakeAccessor) ReturnTypes() []*celgo.Type { return f.rt }
++
++// newCompilerForTest returns a *compiler attached to the process-wide cache
++// (i.e. with a non-nil templateID), so tests can verify cache behavior.
++func newCompilerForTest(t *testing.T) Compiler {
++	t.Helper()
++	env := environment.MustBaseEnvSet(environment.DefaultCompatibilityVersion())
++	return newCachedCompiler(env, env)
++}
++
++func TestCompileCache_DedupesIdenticalExpressions(t *testing.T) {
++	restore := SetCompileCacheSizeForTests(64)
++	defer restore()
++
++	c := newCompilerForTest(t)
++	a1 := &fakeAccessor{expr: "1 == 1", rt: []*celgo.Type{celgo.BoolType}, identity: "first"}
++	a2 := &fakeAccessor{expr: "1 == 1", rt: []*celgo.Type{celgo.BoolType}, identity: "second"}
++
++	r1 := c.CompileCELExpression(a1, OptionalVariableDeclarations{}, environment.StoredExpressions)
++	if r1.Error != nil {
++		t.Fatalf("first compile errored: %v", r1.Error)
++	}
++	r2 := c.CompileCELExpression(a2, OptionalVariableDeclarations{}, environment.StoredExpressions)
++	if r2.Error != nil {
++		t.Fatalf("second compile errored: %v", r2.Error)
++	}
++
++	// Same Program pointer means we hit the cache.
++	if r1.Program == nil || r2.Program == nil {
++		t.Fatalf("expected non-nil programs, got %v and %v", r1.Program, r2.Program)
++	}
++	// Cache holds the same Program; the wrapper struct is rebuilt per call.
++	if got, want := GetCompileCacheStats().Hits, int64(1); got != want {
++		t.Errorf("expected exactly %d cache hit, got %d (misses=%d)", want, got, GetCompileCacheStats().Misses)
++	}
++
++	// ExpressionAccessor is rebound to the caller's instance on a hit.
++	if r2.ExpressionAccessor != a2 {
++		t.Errorf("ExpressionAccessor not rebound on cache hit")
++	}
++}
++
++func TestCompileCache_RespectsOptionalDecls(t *testing.T) {
++	restore := SetCompileCacheSizeForTests(64)
++	defer restore()
++
++	c := newCompilerForTest(t)
++	a := &fakeAccessor{expr: "object == oldObject", rt: []*celgo.Type{celgo.BoolType}}
++
++	_ = c.CompileCELExpression(a, OptionalVariableDeclarations{HasParams: false}, environment.StoredExpressions)
++	_ = c.CompileCELExpression(a, OptionalVariableDeclarations{HasParams: true}, environment.StoredExpressions)
++
++	if got := GetCompileCacheStats().Hits; got != 0 {
++		t.Errorf("expected 0 hits across different OptionalVariableDeclarations, got %d", got)
++	}
++	if got := GetCompileCacheStats().Misses; got != 2 {
++		t.Errorf("expected 2 misses, got %d", got)
++	}
++}
++
++func TestCompileCache_RespectsEnvType(t *testing.T) {
++	restore := SetCompileCacheSizeForTests(64)
++	defer restore()
++
++	c := newCompilerForTest(t)
++	a := &fakeAccessor{expr: "1 == 1", rt: []*celgo.Type{celgo.BoolType}}
++
++	_ = c.CompileCELExpression(a, OptionalVariableDeclarations{}, environment.StoredExpressions)
++	_ = c.CompileCELExpression(a, OptionalVariableDeclarations{}, environment.NewExpressions)
++
++	if got := GetCompileCacheStats().Hits; got != 0 {
++		t.Errorf("expected 0 hits across different envTypes, got %d", got)
++	}
++}
++
++func TestCompileCache_DoesNotCacheCompilationErrors(t *testing.T) {
++	restore := SetCompileCacheSizeForTests(64)
++	defer restore()
++
++	c := newCompilerForTest(t)
++	a := &fakeAccessor{expr: "this is not valid CEL", rt: []*celgo.Type{celgo.BoolType}}
++
++	r1 := c.CompileCELExpression(a, OptionalVariableDeclarations{}, environment.StoredExpressions)
++	if r1.Error == nil {
++		t.Fatalf("expected compile error, got success")
++	}
++	r2 := c.CompileCELExpression(a, OptionalVariableDeclarations{}, environment.StoredExpressions)
++	if r2.Error == nil {
++		t.Fatalf("expected compile error on second call too")
++	}
++	if got := GetCompileCacheStats().Hits; got != 0 {
++		t.Errorf("expected 0 hits (errors must not be cached), got %d", got)
++	}
++	if got := GetCompileCacheStats().Misses; got != 2 {
++		t.Errorf("expected 2 misses, got %d", got)
++	}
++}
++
++func TestCompileCache_NormalizesLeadingTrailingWhitespace(t *testing.T) {
++	restore := SetCompileCacheSizeForTests(64)
++	defer restore()
++
++	c := newCompilerForTest(t)
++	r1 := c.CompileCELExpression(&fakeAccessor{expr: "1 == 1", rt: []*celgo.Type{celgo.BoolType}}, OptionalVariableDeclarations{}, environment.StoredExpressions)
++	r2 := c.CompileCELExpression(&fakeAccessor{expr: "  1 == 1\n", rt: []*celgo.Type{celgo.BoolType}}, OptionalVariableDeclarations{}, environment.StoredExpressions)
++	if r1.Error != nil || r2.Error != nil {
++		t.Fatalf("unexpected errors: %v %v", r1.Error, r2.Error)
++	}
++	if got := GetCompileCacheStats().Hits; got != 1 {
++		t.Errorf("expected 1 cache hit (whitespace-only difference), got %d", got)
++	}
++}
++
++func TestCompileCache_BoundedSize(t *testing.T) {
++	restore := SetCompileCacheSizeForTests(2)
++	defer restore()
++
++	c := newCompilerForTest(t)
++	exprs := []string{"1 == 1", "2 == 2", "3 == 3"}
++	for _, e := range exprs {
++		r := c.CompileCELExpression(&fakeAccessor{expr: e, rt: []*celgo.Type{celgo.BoolType}}, OptionalVariableDeclarations{}, environment.StoredExpressions)
++		if r.Error != nil {
++			t.Fatalf("compile error for %q: %v", e, r.Error)
++		}
++	}
++	if got, want := compileCache().Len(), 2; got != want {
++		t.Errorf("cache size: got %d, want %d", got, want)
++	}
++}
+diff --git a/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/composition.go b/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/composition.go
+index d7456d090b3..7e7ddf69651 100644
+--- a/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/composition.go
++++ b/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/composition.go
+@@ -19,6 +19,8 @@ package cel
+ import (
+ 	"context"
+ 	"math"
++	"sort"
++	"strings"
+ 
+ 	"github.com/google/cel-go/cel"
+ 	"github.com/google/cel-go/common/types"
+@@ -83,11 +85,19 @@ func NewCompositedCompiler(envSet *environment.EnvSet) (*CompositedCompiler, err
+ 		compiledVariables: map[string]CompilationResult{},
+ 	}
+ 
+-	compiler := NewCompiler(state.EnvSet)
+-	conditionCompiler := &conditionCompiler{compiler}
+-	mutation := &mutatingCompiler{compiler}
++	// Build a cached compiler keyed by the *base* env template (envSet),
++	// not the per-policy newEnvSet. Two CompositedCompilers built from the
++	// same template — i.e. the singleton getCompositionEnvTemplateWithStrictCost()
++	// in production — share entries in the process-wide program cache.
++	// Wire the per-policy variable signature provider so the cache key also
++	// differentiates between policies that declare different variable types.
++	baseCompiler := newCachedCompiler(state.EnvSet, envSet)
++	baseCompiler.variableSigFn = state.variableSignature
++
++	conditionCompiler := &conditionCompiler{baseCompiler}
++	mutation := &mutatingCompiler{baseCompiler}
+ 	return &CompositedCompiler{
+-		Compiler:          compiler,
++		Compiler:          baseCompiler,
+ 		ConditionCompiler: conditionCompiler,
+ 		MutatingCompiler:  mutation,
+ 		state:             state,
+@@ -173,6 +183,35 @@ func (c *compositionState) AddField(name string, celType *cel.Type) {
+ 	c.mapType.Fields[name] = apiservercel.NewDeclField(name, convertCelTypeToDeclType(celType), true, nil, nil)
+ }
+ 
++// variableSignature returns a sorted, deterministic snapshot of the in-scope
++// composition variables of the form "name:typeName\n" repeated for each
++// variable. Used as input to the program cache key so that two policies with
++// different variable declarations don't share compiled programs that
++// reference the variables map.
++func (c *compositionState) variableSignature() string {
++	if len(c.compiledVariables) == 0 {
++		return ""
++	}
++	names := make([]string, 0, len(c.compiledVariables))
++	for n := range c.compiledVariables {
++		names = append(names, n)
++	}
++	sort.Strings(names)
++	var b strings.Builder
++	for _, n := range names {
++		b.WriteString(n)
++		b.WriteByte(':')
++		t := c.compiledVariables[n].OutputType
++		if t == nil {
++			b.WriteString("dyn")
++		} else {
++			b.WriteString(t.String())
++		}
++		b.WriteByte('\n')
++	}
++	return b.String()
++}
++
+ func (c *compositionState) CreateContext(parent context.Context) CompositionContext {
+ 	return &compositionContext{
+ 		Context: parent,
