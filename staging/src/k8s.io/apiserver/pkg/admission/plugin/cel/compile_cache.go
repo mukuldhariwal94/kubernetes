@@ -37,10 +37,13 @@ func reflectPointer(p *environment.EnvSet) uintptr {
 }
 
 // defaultCompileCacheSize bounds how many distinct compiled CEL programs are
-// kept in the process-wide cache. Each entry holds one cel.Program (typically
-// 30-200 KB), so 5000 entries cap the cache footprint at a few hundred MB
-// even on pathological clusters.
-const defaultCompileCacheSize = 5000
+// kept in the process-wide cache. Empirical apiserver heap profiles put the
+// retained cost of a single cel.Program at ~150-250 KB (the per-program
+// FunctionDecl.Bindings + interpreter Dispatcher copy dominate, see
+// issue-131417). 1500 entries caps the cache footprint at ~300-400 MB on
+// clusters with thousands of distinct expressions while preserving near-
+// optimal hit rates on templated workloads.
+const defaultCompileCacheSize = 1500
 
 var (
 	// globalCompileCache is swapped via atomic.Pointer so the hot path of
