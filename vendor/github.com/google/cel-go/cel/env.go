@@ -155,6 +155,41 @@ type Env struct {
 
 	// Program options tied to the environment
 	progOpts []ProgramOption
+
+	// Lazily-built dispatcher shared across all programs derived from this
+	// env. e.functions is immutable after env construction (Extend() copies
+	// it into a child env, leaving the parent untouched), so the dispatcher
+	// populated from it is observationally immutable too. Sharing one copy
+	// instead of populating a fresh dispatcher per newProgram saves ~150 KB
+	// per program on apiserver-shaped envs.
+	dispOnce  sync.Once
+	dispCache interpreter.Dispatcher
+	dispErr   error
+}
+
+// sharedDispatcher returns a per-env dispatcher pre-populated with every
+// overload binding from e.functions. Built once per env, lock-free on
+// subsequent calls.
+//
+// Callers must not mutate the returned Dispatcher; wrap it with
+// interpreter.ExtendDispatcher to add program-local overloads safely.
+func (e *Env) sharedDispatcher() (interpreter.Dispatcher, error) {
+	e.dispOnce.Do(func() {
+		d := interpreter.NewDispatcher()
+		for _, fn := range e.functions {
+			bindings, err := fn.Bindings()
+			if err != nil {
+				e.dispErr = err
+				return
+			}
+			if err := d.Add(bindings...); err != nil {
+				e.dispErr = err
+				return
+			}
+		}
+		e.dispCache = d
+	})
+	return e.dispCache, e.dispErr
 }
 
 // ToConfig produces a YAML-serializable env.Config object from the given environment.

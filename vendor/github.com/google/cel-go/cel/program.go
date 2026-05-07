@@ -170,8 +170,16 @@ type prog struct {
 //
 // If the program cannot be configured the prog will be nil, with a non-nil error response.
 func newProgram(e *Env, a *ast.AST, opts []ProgramOption) (Program, error) {
-	// Build the dispatcher, interpreter, and default program value.
-	disp := interpreter.NewDispatcher()
+	// Reuse the env's shared dispatcher for the bulk of the function bindings
+	// (every overload from e.functions is materialised exactly once per env).
+	// Wrap it with ExtendDispatcher so the deprecated Functions() ProgramOption
+	// can still register program-local overloads in an isolated overlay
+	// without mutating the shared parent.
+	parentDisp, err := e.sharedDispatcher()
+	if err != nil {
+		return nil, err
+	}
+	disp := interpreter.ExtendDispatcher(parentDisp)
 
 	// Ensure the default attribute factory is set after the adapter and provider are
 	// configured.
@@ -182,22 +190,11 @@ func newProgram(e *Env, a *ast.AST, opts []ProgramOption) (Program, error) {
 		costOptions:    []interpreter.CostTrackerOption{},
 	}
 
-	// Configure the program via the ProgramOption values.
-	var err error
+	// Configure the program via the ProgramOption values. The deprecated
+	// Functions() option mutates p.dispatcher, which is the per-program
+	// overlay above, not the shared parent.
 	for _, opt := range opts {
 		p, err = opt(p)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	// Add the function bindings created via Function() options.
-	for _, fn := range e.functions {
-		bindings, err := fn.Bindings()
-		if err != nil {
-			return nil, err
-		}
-		err = disp.Add(bindings...)
 		if err != nil {
 			return nil, err
 		}
