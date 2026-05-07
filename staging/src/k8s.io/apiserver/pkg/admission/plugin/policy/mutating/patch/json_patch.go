@@ -54,11 +54,14 @@ func (v *JSONPatchCondition) GetExpression() string {
 	return v.Expression
 }
 
-func (v *JSONPatchCondition) ReturnTypes() []*celgo.Type {
-	return []*celgo.Type{celgo.ListType(jsonPatchType)}
-}
+var (
+	jsonPatchType            = types.NewObjectType("JSONPatch")
+	jsonPatchConditionReturn = []*celgo.Type{celgo.ListType(jsonPatchType)}
+)
 
-var jsonPatchType = types.NewObjectType("JSONPatch")
+func (v *JSONPatchCondition) ReturnTypes() []*celgo.Type {
+	return jsonPatchConditionReturn
+}
 
 // NewJSONPatcher creates a patcher that performs a JSON Patch mutation.
 func NewJSONPatcher(patchEvaluator plugincel.MutatingEvaluator) Patcher {

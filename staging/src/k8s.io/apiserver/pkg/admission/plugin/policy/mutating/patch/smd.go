@@ -49,11 +49,14 @@ func (v *ApplyConfigurationCondition) GetExpression() string {
 	return v.Expression
 }
 
-func (v *ApplyConfigurationCondition) ReturnTypes() []*celgo.Type {
-	return []*celgo.Type{applyConfigObjectType}
-}
+var (
+	applyConfigObjectType            = celtypes.NewObjectType("Object")
+	applyConfigConditionReturnTypes  = []*celgo.Type{applyConfigObjectType}
+)
 
-var applyConfigObjectType = celtypes.NewObjectType("Object")
+func (v *ApplyConfigurationCondition) ReturnTypes() []*celgo.Type {
+	return applyConfigConditionReturnTypes
+}
 
 // NewApplyConfigurationPatcher creates a patcher that performs an applyConfiguration mutation.
 func NewApplyConfigurationPatcher(expressionEvaluator plugincel.MutatingEvaluator) Patcher {

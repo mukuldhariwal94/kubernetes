@@ -229,8 +229,10 @@ func (c celExpression) GetExpression() string {
 	return string(c)
 }
 
+var celExpressionReturnTypes = []*cel.Type{cel.AnyType}
+
 func (c celExpression) ReturnTypes() []*cel.Type {
-	return []*cel.Type{cel.AnyType}
+	return celExpressionReturnTypes
 }
 func generateUniqueTypeName(kind string) string {
 	return fmt.Sprintf("%s%d", kind, time.Now().Nanosecond())

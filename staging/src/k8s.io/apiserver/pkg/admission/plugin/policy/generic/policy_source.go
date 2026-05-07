@@ -301,7 +301,12 @@ func (s *policySource[P, B, E]) calculatePolicyData() ([]PolicyHook[P, B, E], er
 		policiesToBindings[policyKey] = append(policiesToBindings[policyKey], bindingSpec)
 	}
 
-	result := make([]PolicyHook[P, B, E], 0, len(bindingList))
+	// Capacity is the unique-policy count, not the binding count. In
+	// multi-tenant clusters where many bindings reference the same
+	// policy, len(bindingList) over-allocates by O(bindings - policies),
+	// which at 100 bindings/policy × 100 policies wastes ~800 KB per
+	// refresh. len(policiesToBindings) is the exact upper bound.
+	result := make([]PolicyHook[P, B, E], 0, len(policiesToBindings))
 	usedParams := map[schema.GroupVersionKind]struct{}{}
 	var errs []error
 	for policyKey, bindingSpecs := range policiesToBindings {

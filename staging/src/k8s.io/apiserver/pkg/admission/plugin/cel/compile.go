@@ -345,11 +345,13 @@ func (c compiler) compileFresh(expressionAccessor ExpressionAccessor, options Op
 		return resultError(reason, apiservercel.ErrorTypeInvalid, nil)
 	}
 
-	_, err = cel.AstToCheckedExpr(ast)
-	if err != nil {
-		// should be impossible since env.Compile returned no issues
-		return resultError("unexpected compilation error: "+err.Error(), apiservercel.ErrorTypeInternal, nil)
-	}
+	// Note: an AstToCheckedExpr defensive call used to live here. It walked
+	// the entire AST building a *exprpb.CheckedExpr proto tree (refMap +
+	// typeMap + recursive ExprToProto) and discarded the result. The only
+	// error case is `!ast.IsChecked()`, which is unreachable here because
+	// env.Compile above returned no issues. Removed to save 1-17 KiB of
+	// transient allocation per CompileCELExpression call (scales with AST
+	// node count).
 	prog, err := env.Program(ast,
 		cel.InterruptCheckFrequency(celconfig.CheckFrequency),
 	)

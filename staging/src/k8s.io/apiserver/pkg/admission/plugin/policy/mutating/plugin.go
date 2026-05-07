@@ -174,8 +174,10 @@ func (v *Variable) GetExpression() string {
 	return v.Expression
 }
 
+var variableReturnTypes = []*celgo.Type{celgo.AnyType, celgo.DynType}
+
 func (v *Variable) ReturnTypes() []*celgo.Type {
-	return []*celgo.Type{celgo.AnyType, celgo.DynType}
+	return variableReturnTypes
 }
 
 func (v *Variable) GetName() string {

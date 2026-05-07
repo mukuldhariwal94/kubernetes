@@ -31,6 +31,8 @@ func (m *MessageExpressionCondition) GetExpression() string {
 	return m.MessageExpression
 }
 
+var messageExpressionConditionReturnTypes = []*celgo.Type{celgo.StringType}
+
 func (m *MessageExpressionCondition) ReturnTypes() []*celgo.Type {
-	return []*celgo.Type{celgo.StringType}
+	return messageExpressionConditionReturnTypes
 }

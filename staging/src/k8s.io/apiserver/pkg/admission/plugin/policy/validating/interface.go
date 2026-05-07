@@ -43,8 +43,10 @@ func (v *ValidationCondition) GetExpression() string {
 	return v.Expression
 }
 
+var validationConditionReturnTypes = []*celgo.Type{celgo.BoolType}
+
 func (v *ValidationCondition) ReturnTypes() []*celgo.Type {
-	return []*celgo.Type{celgo.BoolType}
+	return validationConditionReturnTypes
 }
 
 // AuditAnnotationCondition contains the inputs needed to compile, evaluate and publish a cel audit annotation
@@ -57,8 +59,10 @@ func (v *AuditAnnotationCondition) GetExpression() string {
 	return v.ValueExpression
 }
 
+var auditAnnotationConditionReturnTypes = []*celgo.Type{celgo.StringType, celgo.NullType}
+
 func (v *AuditAnnotationCondition) ReturnTypes() []*celgo.Type {
-	return []*celgo.Type{celgo.StringType, celgo.NullType}
+	return auditAnnotationConditionReturnTypes
 }
 
 // Variable is a named expression for composition.
@@ -71,8 +75,10 @@ func (v *Variable) GetExpression() string {
 	return v.Expression
 }
 
+var variableReturnTypes = []*celgo.Type{celgo.AnyType, celgo.DynType}
+
 func (v *Variable) ReturnTypes() []*celgo.Type {
-	return []*celgo.Type{celgo.AnyType, celgo.DynType}
+	return variableReturnTypes
 }
 
 func (v *Variable) GetName() string {

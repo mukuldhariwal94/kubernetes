@@ -46,8 +46,10 @@ func (v *MatchCondition) GetExpression() string {
 	return v.Expression
 }
 
+var matchConditionReturnTypes = []*cel.Type{cel.BoolType}
+
 func (v *MatchCondition) ReturnTypes() []*cel.Type {
-	return []*cel.Type{cel.BoolType}
+	return matchConditionReturnTypes
 }
 
 var _ Matcher = &matcher{}
