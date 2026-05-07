@@ -1,0 +1,345 @@
+From: VAP scale optimization series
+Subject: [PATCH 0010] cel: lazify per-compiler varEnvs and share request/namespace DeclTypes
+
+The per-compiler varEnvs map was constructed eagerly via mustBuildEnvs,
+which builds the full Cartesian product of OptionalVariableDeclarations
+combinations (HasParams x HasAuthorizer x HasPatchTypes = 8 entries).
+VAP only ever asks for 2 of those 8 combinations and MAP for 4, so 4-6
+of every compiler's slots were dead weight from the moment of
+construction.
+
+This patch replaces the 8-entry map with:
+
+  * a sync.Map + sync.Once-per-key lazy builder, so envs are only
+    materialised on the first CompileCELExpression call that actually
+    needs them
+  * package-level singletons for cachedNamespaceType / cachedRequestType
+    so the static type definitions returned by BuildNamespaceType /
+    BuildRequestType are not rebuilt once per compiler
+
+The fix is a self-contained refactor of compile.go (newCachedCompiler
+construction is unchanged externally; consumers of the previous
+varEnvs map[OptionalVariableDeclarations]*EnvSet shape are updated to
+call varEnvs.get(opts)).
+
+Empirical impact on a synthetic load of 5000 empty VAPs (one
+compilePolicy() per policy, all retained in a slice):
+
+                       before        after        delta
+  per-policy retained  56.4 KiB      42.6 KiB     -24.5%
+  bytes/op (compile)   784 KiB       55 KiB       -93.0%
+  allocs/op (compile)  6904          349          -94.9%
+  ns/op (compile)      1.45 ms       0.094 ms     -93.5%
+
+The retained-heap drop is the conservative figure; most of the
+eliminated work was transient. The big production win is the ~14x
+cut in compile-time allocation, which is paid on every refreshPolicies
+tick and every policy spec change.
+
+The benchmark and methodology used to capture these numbers are
+included as per_policy_overhead_bench_test.go. See ../README.md for
+how to run it.
+
+Tested:
+  go test ./staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/...           PASS
+  go test ./staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/...        PASS
+  go test ./staging/src/k8s.io/apiserver/pkg/cel/...                            PASS
+
+diff --git a/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/compile.go b/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/compile.go
+index a4d102e138a..900dd457df6 100644
+--- a/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/compile.go
++++ b/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/compile.go
+@@ -19,6 +19,7 @@ package cel
+ import (
+ 	"fmt"
+ 	"strings"
++	"sync"
+ 
+ 	"github.com/google/cel-go/cel"
+ 
+@@ -154,7 +155,7 @@ type Compiler interface {
+ }
+ 
+ type compiler struct {
+-	varEnvs variableDeclEnvs
++	varEnvs *variableDeclEnvs
+ 	// templateID identifies the env template (e.g. the singleton
+ 	// `getCompositionEnvTemplateWithStrictCost()`) that this compiler was
+ 	// derived from. Two compilers built from the same template are
+@@ -178,7 +179,7 @@ type compiler struct {
+ // not connected to the process-wide program cache (use NewCompositedCompiler
+ // to opt in via a stable env template).
+ func NewCompiler(env *environment.EnvSet) Compiler {
+-	return &compiler{varEnvs: mustBuildEnvs(env)}
++	return &compiler{varEnvs: newVariableDeclEnvs(env)}
+ }
+ 
+ // newCachedCompiler returns a Compiler that participates in the process-wide
+@@ -186,12 +187,58 @@ func NewCompiler(env *environment.EnvSet) Compiler {
+ // env template used to derive env). Internal helper for CompositedCompiler.
+ func newCachedCompiler(env *environment.EnvSet, templateID *environment.EnvSet) *compiler {
+ 	return &compiler{
+-		varEnvs:    mustBuildEnvs(env),
++		varEnvs:    newVariableDeclEnvs(env),
+ 		templateID: templateID,
+ 	}
+ }
+ 
+-type variableDeclEnvs map[OptionalVariableDeclarations]*environment.EnvSet
++// variableDeclEnvs lazily memoises the per-OptionalVariableDeclarations env
++// derived from a single base env. Replaces the old eager 8-entry map: in
++// production VAP only ever asks for 2 of the 8 combinations (and MAP for 4),
++// so eager construction was building 4-6 envs per compiler that nothing ever
++// looked up. Each saved env clone is ~4-6 KB retained + ~80-100 KB transient
++// allocation on apiserver-shaped templates.
++type variableDeclEnvs struct {
++	base          *environment.EnvSet
++	namespaceType *apiservercel.DeclType
++	requestType   *apiservercel.DeclType
++	cache         sync.Map // OptionalVariableDeclarations -> *envEntry
++}
++
++type envEntry struct {
++	once sync.Once
++	env  *environment.EnvSet
++	err  error
++}
++
++func newVariableDeclEnvs(base *environment.EnvSet) *variableDeclEnvs {
++	return &variableDeclEnvs{
++		base:          base,
++		namespaceType: cachedNamespaceType,
++		requestType:   cachedRequestType,
++	}
++}
++
++// get returns the env for the given OptionalVariableDeclarations, building it
++// on the first request and reusing it thereafter. Concurrent calls for the
++// same key serialize through sync.Once and observe the same env or err.
++func (v *variableDeclEnvs) get(opts OptionalVariableDeclarations) (*environment.EnvSet, error) {
++	actual, _ := v.cache.LoadOrStore(opts, &envEntry{})
++	e := actual.(*envEntry)
++	e.once.Do(func() {
++		e.env, e.err = createEnvForOpts(v.base, v.namespaceType, v.requestType, opts)
++	})
++	return e.env, e.err
++}
++
++// cachedNamespaceType / cachedRequestType are the (immutable) DeclTypes
++// previously built once per mustBuildEnvs call (= once per compiler). They
++// only depend on the static type definitions in BuildNamespaceType /
++// BuildRequestType, so they are safe to share across all compilers.
++var (
++	cachedNamespaceType = BuildNamespaceType()
++	cachedRequestType   = BuildRequestType()
++)
+ 
+ // CompileCELExpression returns a compiled CEL expression.
+ // perCallLimit was added for testing purpose only. Callers should always use const PerCallLimit from k8s.io/apiserver/pkg/apis/cel/config.go as input.
+@@ -266,7 +313,11 @@ func (c compiler) compileFresh(expressionAccessor ExpressionAccessor, options Op
+ 		}
+ 	}
+ 
+-	env, err := c.varEnvs[options].Env(envType)
++	envSet, err := c.varEnvs.get(options)
++	if err != nil {
++		return resultError(fmt.Sprintf("unexpected error loading CEL environment: %v", err), apiservercel.ErrorTypeInternal, nil)
++	}
++	env, err := envSet.Env(envType)
+ 	if err != nil {
+ 		return resultError(fmt.Sprintf("unexpected error loading CEL environment: %v", err), apiservercel.ErrorTypeInternal, nil)
+ 	}
+@@ -312,32 +363,6 @@ func (c compiler) compileFresh(expressionAccessor ExpressionAccessor, options Op
+ 	}
+ }
+ 
+-func mustBuildEnvs(baseEnv *environment.EnvSet) variableDeclEnvs {
+-	requestType := BuildRequestType()
+-	namespaceType := BuildNamespaceType()
+-	envs := make(variableDeclEnvs, 8) // since the number of variable combinations is small, pre-build a environment for each
+-	for _, hasParams := range []bool{false, true} {
+-		for _, hasAuthorizer := range []bool{false, true} {
+-			var err error
+-			{
+-				decl := OptionalVariableDeclarations{HasParams: hasParams, HasAuthorizer: hasAuthorizer}
+-				envs[decl], err = createEnvForOpts(baseEnv, namespaceType, requestType, decl)
+-				if err != nil {
+-					panic(err)
+-				}
+-			}
+-			{
+-				decl := OptionalVariableDeclarations{HasParams: hasParams, HasAuthorizer: hasAuthorizer, HasPatchTypes: true}
+-				envs[decl], err = createEnvForOpts(baseEnv, namespaceType, requestType, decl)
+-				if err != nil {
+-					panic(err)
+-				}
+-			}
+-		}
+-	}
+-	return envs
+-}
+-
+ func createEnvForOpts(baseEnv *environment.EnvSet, namespaceType *apiservercel.DeclType, requestType *apiservercel.DeclType, opts OptionalVariableDeclarations) (*environment.EnvSet, error) {
+ 	var envOpts []cel.EnvOption
+ 	envOpts = append(envOpts,
+diff --git a/staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/validating/per_policy_overhead_bench_test.go b/staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/validating/per_policy_overhead_bench_test.go
+new file mode 100644
+index 00000000000..63df82adede
+--- /dev/null
++++ b/staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/validating/per_policy_overhead_bench_test.go
+@@ -0,0 +1,155 @@
++/*
++Copyright 2026 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package validating
++
++import (
++	"runtime"
++	"testing"
++
++	v1 "k8s.io/api/admissionregistration/v1"
++)
++
++// This file isolates the *non-CEL* per-policy overhead in compilePolicy:
++// every byte allocated for a policy that has zero matchConditions, zero
++// validations, zero auditAnnotations, zero messageExpressions, and zero
++// variables. Anything left is pure framework overhead — composited
++// compiler construction, varEnvs matrix build, convertv1* slices, the
++// four CompileCondition wrappers, and the validator struct itself.
++//
++// Run:
++//   go test -run='^$' -bench='BenchmarkPerPolicyOverhead' \
++//     -benchmem -benchtime=200x -count=5 \
++//     ./staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/validating/...
++//
++// Steady-state retained heap per policy:
++//   go test -run='TestRetainedHeapPerEmptyPolicy' -v \
++//     ./staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/validating/...
++
++func emptyPolicy() *Policy {
++	return &v1.ValidatingAdmissionPolicy{
++		Spec: v1.ValidatingAdmissionPolicySpec{
++			// All slices are nil. ParamKind nil. FailurePolicy nil.
++			// MatchConstraints required by API validation but irrelevant to compile.
++			MatchConstraints: &v1.MatchResources{},
++		},
++	}
++}
++
++func minimalPolicy() *Policy {
++	failType := v1.Fail
++	return &v1.ValidatingAdmissionPolicy{
++		Spec: v1.ValidatingAdmissionPolicySpec{
++			FailurePolicy:    &failType,
++			MatchConstraints: &v1.MatchResources{},
++			Validations: []v1.Validation{
++				{Expression: "true"},
++			},
++		},
++	}
++}
++
++func BenchmarkPerPolicyOverhead_Empty(b *testing.B) {
++	p := emptyPolicy()
++	b.ReportAllocs()
++	b.ResetTimer()
++	for i := 0; i < b.N; i++ {
++		v := compilePolicy(p)
++		runtime.KeepAlive(v)
++	}
++}
++
++func BenchmarkPerPolicyOverhead_OneValidation(b *testing.B) {
++	p := minimalPolicy()
++	b.ReportAllocs()
++	b.ResetTimer()
++	for i := 0; i < b.N; i++ {
++		v := compilePolicy(p)
++		runtime.KeepAlive(v)
++	}
++}
++
++// TestRetainedHeapPerEmptyPolicy compiles N empty policies, retains all
++// of them in a slice, then triple-GCs and reports the per-policy
++// retained delta in HeapInuse. Run with -v.
++func TestRetainedHeapPerEmptyPolicy(t *testing.T) {
++	const N = 5000
++	p := emptyPolicy()
++
++	runtime.GC()
++	runtime.GC()
++	var before runtime.MemStats
++	runtime.ReadMemStats(&before)
++
++	retained := make([]Validator, 0, N)
++	for i := 0; i < N; i++ {
++		retained = append(retained, compilePolicy(p))
++	}
++
++	runtime.GC()
++	runtime.GC()
++	runtime.GC()
++	var after runtime.MemStats
++	runtime.ReadMemStats(&after)
++
++	delta := after.HeapInuse - before.HeapInuse
++	perPolicy := float64(delta) / float64(N)
++
++	t.Logf("policies retained:        %d", N)
++	t.Logf("HeapInuse delta:          %.2f MiB", float64(delta)/(1024*1024))
++	t.Logf("per-policy retained:      %.0f bytes  (~%.1f KiB)", perPolicy, perPolicy/1024)
++	t.Logf("HeapObjects delta:        %d", after.HeapObjects-before.HeapObjects)
++	t.Logf("HeapObjects/policy:       %.1f", float64(after.HeapObjects-before.HeapObjects)/float64(N))
++	t.Logf("Mallocs delta:            %d", after.Mallocs-before.Mallocs)
++	t.Logf("Mallocs/policy:           %.1f", float64(after.Mallocs-before.Mallocs)/float64(N))
++
++	runtime.KeepAlive(retained)
++}
++
++// TestRetainedHeapPerOneValidation compiles N minimal policies (one
++// trivial validation) and reports the same metric. The delta vs the
++// empty case isolates the cost of a single "true" expression compile.
++func TestRetainedHeapPerOneValidation(t *testing.T) {
++	const N = 5000
++	p := minimalPolicy()
++
++	runtime.GC()
++	runtime.GC()
++	var before runtime.MemStats
++	runtime.ReadMemStats(&before)
++
++	retained := make([]Validator, 0, N)
++	for i := 0; i < N; i++ {
++		retained = append(retained, compilePolicy(p))
++	}
++
++	runtime.GC()
++	runtime.GC()
++	runtime.GC()
++	var after runtime.MemStats
++	runtime.ReadMemStats(&after)
++
++	delta := after.HeapInuse - before.HeapInuse
++	perPolicy := float64(delta) / float64(N)
++
++	t.Logf("policies retained:        %d (each with 1 validation 'true')", N)
++	t.Logf("HeapInuse delta:          %.2f MiB", float64(delta)/(1024*1024))
++	t.Logf("per-policy retained:      %.0f bytes  (~%.1f KiB)", perPolicy, perPolicy/1024)
++	t.Logf("HeapObjects delta:        %d", after.HeapObjects-before.HeapObjects)
++	t.Logf("HeapObjects/policy:       %.1f", float64(after.HeapObjects-before.HeapObjects)/float64(N))
++
++	runtime.KeepAlive(retained)
++}

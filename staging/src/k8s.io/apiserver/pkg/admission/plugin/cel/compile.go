@@ -19,6 +19,7 @@ package cel
 import (
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/google/cel-go/cel"
 
@@ -154,7 +155,7 @@ type Compiler interface {
 }
 
 type compiler struct {
-	varEnvs variableDeclEnvs
+	varEnvs *variableDeclEnvs
 	// templateID identifies the env template (e.g. the singleton
 	// `getCompositionEnvTemplateWithStrictCost()`) that this compiler was
 	// derived from. Two compilers built from the same template are
@@ -178,7 +179,7 @@ type compiler struct {
 // not connected to the process-wide program cache (use NewCompositedCompiler
 // to opt in via a stable env template).
 func NewCompiler(env *environment.EnvSet) Compiler {
-	return &compiler{varEnvs: mustBuildEnvs(env)}
+	return &compiler{varEnvs: newVariableDeclEnvs(env)}
 }
 
 // newCachedCompiler returns a Compiler that participates in the process-wide
@@ -186,12 +187,58 @@ func NewCompiler(env *environment.EnvSet) Compiler {
 // env template used to derive env). Internal helper for CompositedCompiler.
 func newCachedCompiler(env *environment.EnvSet, templateID *environment.EnvSet) *compiler {
 	return &compiler{
-		varEnvs:    mustBuildEnvs(env),
+		varEnvs:    newVariableDeclEnvs(env),
 		templateID: templateID,
 	}
 }
 
-type variableDeclEnvs map[OptionalVariableDeclarations]*environment.EnvSet
+// variableDeclEnvs lazily memoises the per-OptionalVariableDeclarations env
+// derived from a single base env. Replaces the old eager 8-entry map: in
+// production VAP only ever asks for 2 of the 8 combinations (and MAP for 4),
+// so eager construction was building 4-6 envs per compiler that nothing ever
+// looked up. Each saved env clone is ~4-6 KB retained + ~80-100 KB transient
+// allocation on apiserver-shaped templates.
+type variableDeclEnvs struct {
+	base          *environment.EnvSet
+	namespaceType *apiservercel.DeclType
+	requestType   *apiservercel.DeclType
+	cache         sync.Map // OptionalVariableDeclarations -> *envEntry
+}
+
+type envEntry struct {
+	once sync.Once
+	env  *environment.EnvSet
+	err  error
+}
+
+func newVariableDeclEnvs(base *environment.EnvSet) *variableDeclEnvs {
+	return &variableDeclEnvs{
+		base:          base,
+		namespaceType: cachedNamespaceType,
+		requestType:   cachedRequestType,
+	}
+}
+
+// get returns the env for the given OptionalVariableDeclarations, building it
+// on the first request and reusing it thereafter. Concurrent calls for the
+// same key serialize through sync.Once and observe the same env or err.
+func (v *variableDeclEnvs) get(opts OptionalVariableDeclarations) (*environment.EnvSet, error) {
+	actual, _ := v.cache.LoadOrStore(opts, &envEntry{})
+	e := actual.(*envEntry)
+	e.once.Do(func() {
+		e.env, e.err = createEnvForOpts(v.base, v.namespaceType, v.requestType, opts)
+	})
+	return e.env, e.err
+}
+
+// cachedNamespaceType / cachedRequestType are the (immutable) DeclTypes
+// previously built once per mustBuildEnvs call (= once per compiler). They
+// only depend on the static type definitions in BuildNamespaceType /
+// BuildRequestType, so they are safe to share across all compilers.
+var (
+	cachedNamespaceType = BuildNamespaceType()
+	cachedRequestType   = BuildRequestType()
+)
 
 // CompileCELExpression returns a compiled CEL expression.
 // perCallLimit was added for testing purpose only. Callers should always use const PerCallLimit from k8s.io/apiserver/pkg/apis/cel/config.go as input.
@@ -266,7 +313,11 @@ func (c compiler) compileFresh(expressionAccessor ExpressionAccessor, options Op
 		}
 	}
 
-	env, err := c.varEnvs[options].Env(envType)
+	envSet, err := c.varEnvs.get(options)
+	if err != nil {
+		return resultError(fmt.Sprintf("unexpected error loading CEL environment: %v", err), apiservercel.ErrorTypeInternal, nil)
+	}
+	env, err := envSet.Env(envType)
 	if err != nil {
 		return resultError(fmt.Sprintf("unexpected error loading CEL environment: %v", err), apiservercel.ErrorTypeInternal, nil)
 	}
@@ -310,32 +361,6 @@ func (c compiler) compileFresh(expressionAccessor ExpressionAccessor, options Op
 		ExpressionAccessor: expressionAccessor,
 		OutputType:         ast.OutputType(),
 	}
-}
-
-func mustBuildEnvs(baseEnv *environment.EnvSet) variableDeclEnvs {
-	requestType := BuildRequestType()
-	namespaceType := BuildNamespaceType()
-	envs := make(variableDeclEnvs, 8) // since the number of variable combinations is small, pre-build a environment for each
-	for _, hasParams := range []bool{false, true} {
-		for _, hasAuthorizer := range []bool{false, true} {
-			var err error
-			{
-				decl := OptionalVariableDeclarations{HasParams: hasParams, HasAuthorizer: hasAuthorizer}
-				envs[decl], err = createEnvForOpts(baseEnv, namespaceType, requestType, decl)
-				if err != nil {
-					panic(err)
-				}
-			}
-			{
-				decl := OptionalVariableDeclarations{HasParams: hasParams, HasAuthorizer: hasAuthorizer, HasPatchTypes: true}
-				envs[decl], err = createEnvForOpts(baseEnv, namespaceType, requestType, decl)
-				if err != nil {
-					panic(err)
-				}
-			}
-		}
-	}
-	return envs
 }
 
 func createEnvForOpts(baseEnv *environment.EnvSet, namespaceType *apiservercel.DeclType, requestType *apiservercel.DeclType, opts OptionalVariableDeclarations) (*environment.EnvSet, error) {
