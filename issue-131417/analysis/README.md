@@ -12,6 +12,7 @@ parser → checker → planner pipeline looks like.
 | [master-analysis.md](master-analysis.md) | Deep-dive analysis written alongside patches 0001–0003. Memory model derivation, root cause, optimization-approach matrix, success criteria. |
 | [extended-analysis.md](extended-analysis.md) | Follow-up analysis with empirical heap-profile data (pprof + sweep benchmark). Adds patches 0004 / 0005 / 0006 / 0009. Re-orders priorities against the first-principles model — pprof revealed `FunctionDecl.Bindings` + `Dispatcher` as ~62 % of heap, which 0009 directly attacks. |
 | [celgo-memory-api-audit.md](celgo-memory-api-audit.md) | Audit of every cel-go public API option (EvalOption / ProgramOption / EnvOption / Library) for memory-saving levers. Top recommendations at the end. Useful when adding new compile sites or tuning existing ones. |
+| [architecture-redesign.md](architecture-redesign.md) | First-principles re-evaluation of VAP's evaluator residency model, with a Kyverno comparison. Argues that all the patches together divide the constant but leave the `O(N_policies)` asymptote intact, and that the right structural change is **demand-driven `cel.Program` materialization** behind a `CheckedExpr`-backed Tier-0 cache. |
 
 ## Reading order
 
