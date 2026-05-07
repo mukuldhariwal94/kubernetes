@@ -29,6 +29,7 @@ Apply order suggestion (highest leverage first):
 | 0009 | [0009-celgo-share-dispatcher/](0009-celgo-share-dispatcher/) | **cel-go** | Share `interpreter.Dispatcher` per `*cel.Env` | applied locally (vendor) |
 | 0010 | [0010-lazy-varenvs/](0010-lazy-varenvs/) | k8s | Lazify per-compiler `varEnvs` + share request/namespace DeclTypes; ~14× cut in per-policy compile-time allocation | prototype, includes benchmark |
 | 0011 | [0011-presize-policy-source-result/](0011-presize-policy-source-result/) | k8s | Pre-size `calculatePolicyData` result slice to unique-policy count; ~790 KiB / refresh saved at 100×100 binding ratio | prototype, includes benchmark |
+| 0012 | [0012-drop-checkedexpr-discard-and-singleton-returntypes/](0012-drop-checkedexpr-discard-and-singleton-returntypes/) | k8s | Drop dead `AstToCheckedExpr` discard in `CompileCELExpression` + singleton `ReturnTypes()` slices; ~17 KiB / 252 allocs saved per complex compile | prototype, includes benchmark |
 
 There is no 0007 — the slot was reserved for the cel-go vendor change
 during planning and the actual change shipped as 0009.

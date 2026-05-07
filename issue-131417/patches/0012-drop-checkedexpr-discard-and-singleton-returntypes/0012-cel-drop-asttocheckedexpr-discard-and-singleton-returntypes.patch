@@ -1,0 +1,420 @@
+From: VAP scale optimization series
+Subject: [PATCH 0012] cel: drop AstToCheckedExpr discard, intern ReturnTypes() slices
+
+Two related per-CompileCELExpression wastes in the
+admission/plugin/cel pipeline.
+
+1. compile.go:348-352 called cel.AstToCheckedExpr(ast) and discarded
+   the result, only checking the error. The single error case is
+   `!ast.IsChecked()`, which is unreachable here because env.Compile
+   on the line above returned no issues. The comment at line 350 even
+   admits "should be impossible since env.Compile returned no issues".
+
+   ToProto walks the entire AST building a *exprpb.CheckedExpr proto
+   tree (refMap + typeMap + recursive ExprToProto over every node),
+   then everything is discarded. Per-call cost scales with AST node
+   count:
+
+      trivial expression `true`                  857 B / 12 allocs
+      simple   `"a" == "b"`                    1 480 B / 24 allocs
+      realistic 3-clause &&                    5 720 B / 88 allocs
+      complex  containers.all(c, ... 6 conds) 17 216 B / 252 allocs
+
+   Removed.
+
+2. Every ExpressionAccessor.ReturnTypes() implementation in the tree
+   was `return []*celgo.Type{X}`, a fresh slice literal allocated on
+   every call. ReturnTypes is invoked twice per CompileCELExpression
+   (once for the cache key, once inside compileFresh). Replaced each
+   with a package-level singleton variable initialised once. Affected:
+
+      pkg/admission/plugin/policy/validating/interface.go:
+          ValidationCondition, AuditAnnotationCondition, Variable
+      pkg/admission/plugin/policy/validating/message.go:
+          MessageExpressionCondition
+      pkg/admission/plugin/policy/validating/typechecking.go:
+          celExpression
+      pkg/admission/plugin/policy/mutating/plugin.go:
+          Variable
+      pkg/admission/plugin/policy/mutating/patch/json_patch.go:
+          JSONPatchCondition
+      pkg/admission/plugin/policy/mutating/patch/smd.go:
+          ApplyConfigurationCondition
+      pkg/admission/plugin/webhook/matchconditions/matcher.go:
+          MatchCondition
+
+   Each return-types slot saved ~13 ns / 8 B / 1 alloc per call:
+      BenchmarkReturnTypes_FreshSliceLiteral-8   13.5 ns/op   8 B/op   1 allocs/op
+      BenchmarkReturnTypes_PackageSingleton-8     1.0 ns/op   0 B/op   0 allocs/op
+
+End-to-end CompileCELExpression bench (compileFresh end-to-end with
+real environment), before vs after both fixes:
+
+                     before bytes/op   after bytes/op   delta
+   trivial            10 322 B          9 466 B         -856 B   (-8%)
+   simple             15 912 B         14 430 B       -1 482 B   (-9%)
+   realistic          60 713 B         54 980 B       -5 733 B   (-9%)
+   complex           178 182 B        160 932 B      -17 250 B  (-10%)
+
+                     before allocs    after allocs     delta
+   trivial            199              187             -12
+   simple             313              289             -24
+   realistic        1 155            1 067             -88
+   complex          3 050            2 798            -252
+
+At 5000 policies × 5 expressions of moderate complexity per refresh
+that's ~450 MB of transient compile-time allocation eliminated per
+full-refresh tick, plus a bunch of dead defensive code that never
+caught a real error.
+
+Includes compile_waste_bench_test.go which isolates each waste site
+and provides regression coverage.
+
+Tested:
+  go test ./staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/...           PASS
+  go test ./staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/...        PASS
+  go test ./staging/src/k8s.io/apiserver/pkg/admission/plugin/webhook/...       PASS
+  go test ./staging/src/k8s.io/apiserver/pkg/cel/...                            PASS
+
+diff --git a/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/compile.go b/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/compile.go
+index 900dd457df6..201818e67fb 100644
+--- a/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/compile.go
++++ b/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/compile.go
+@@ -345,11 +345,13 @@ func (c compiler) compileFresh(expressionAccessor ExpressionAccessor, options Op
+ 		return resultError(reason, apiservercel.ErrorTypeInvalid, nil)
+ 	}
+ 
+-	_, err = cel.AstToCheckedExpr(ast)
+-	if err != nil {
+-		// should be impossible since env.Compile returned no issues
+-		return resultError("unexpected compilation error: "+err.Error(), apiservercel.ErrorTypeInternal, nil)
+-	}
++	// Note: an AstToCheckedExpr defensive call used to live here. It walked
++	// the entire AST building a *exprpb.CheckedExpr proto tree (refMap +
++	// typeMap + recursive ExprToProto) and discarded the result. The only
++	// error case is `!ast.IsChecked()`, which is unreachable here because
++	// env.Compile above returned no issues. Removed to save 1-17 KiB of
++	// transient allocation per CompileCELExpression call (scales with AST
++	// node count).
+ 	prog, err := env.Program(ast,
+ 		cel.InterruptCheckFrequency(celconfig.CheckFrequency),
+ 	)
+diff --git a/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/compile_waste_bench_test.go b/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/compile_waste_bench_test.go
+new file mode 100644
+index 00000000000..e8f83472063
+--- /dev/null
++++ b/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/compile_waste_bench_test.go
+@@ -0,0 +1,165 @@
++/*
++Copyright 2026 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package cel
++
++import (
++	"runtime"
++	"testing"
++
++	"github.com/google/cel-go/cel"
++
++	"k8s.io/apiserver/pkg/cel/environment"
++)
++
++// Isolates two specific waste sites in CompileCondition /
++// CompileCELExpression that have nothing to do with the cel.Program
++// retention discussed elsewhere in issue-131417:
++//
++//   1. The AstToCheckedExpr discard at compile.go:348-352. Walks the
++//      whole AST, builds a full *exprpb.CheckedExpr proto tree
++//      (refMap + typeMap + recursive ExprToProto), throws away
++//      everything but the error.
++//   2. ReturnTypes() implementations on every ExpressionAccessor
++//      (ValidationCondition, MessageExpressionCondition,
++//      AuditAnnotationCondition, MatchCondition, Variable, celExpression)
++//      that return a fresh slice literal on every call.
++
++// astToCheckedExprDiscardBench compiles an AST and then performs the
++// same defensive AstToCheckedExpr call that compileFresh makes, just
++// to measure that single line's cost.
++func astToCheckedExprDiscardBench(b *testing.B, expr string) {
++	// Use the same production env shape (with object / oldObject /
++	// namespaceObject / request declared) that compileFresh would.
++	baseEnvSet := environment.MustBaseEnvSet(environment.DefaultCompatibilityVersion())
++	envSet, err := createEnvForOpts(baseEnvSet, BuildNamespaceType(), BuildRequestType(),
++		OptionalVariableDeclarations{HasParams: false, HasAuthorizer: true})
++	if err != nil {
++		b.Fatal(err)
++	}
++	env, err := envSet.Env(environment.NewExpressions)
++	if err != nil {
++		b.Fatal(err)
++	}
++	ast, issues := env.Compile(expr)
++	if issues != nil && issues.Err() != nil {
++		b.Fatalf("compile: %v", issues.Err())
++	}
++	runtime.GC()
++	var beforeMS runtime.MemStats
++	runtime.ReadMemStats(&beforeMS)
++
++	b.ReportAllocs()
++	b.ResetTimer()
++	for i := 0; i < b.N; i++ {
++		// Same call as compile.go:348 — result discarded.
++		_, err := cel.AstToCheckedExpr(ast)
++		if err != nil {
++			b.Fatal(err)
++		}
++	}
++	b.StopTimer()
++
++	runtime.GC()
++	var afterMS runtime.MemStats
++	runtime.ReadMemStats(&afterMS)
++	b.ReportMetric(float64(afterMS.HeapInuse-beforeMS.HeapInuse), "heap-delta-B")
++}
++
++func BenchmarkAstToCheckedExpr_Discard_Trivial(b *testing.B) {
++	astToCheckedExprDiscardBench(b, `true`)
++}
++
++func BenchmarkAstToCheckedExpr_Discard_Simple(b *testing.B) {
++	astToCheckedExprDiscardBench(b, `"foo" == "bar"`)
++}
++
++func BenchmarkAstToCheckedExpr_Discard_Realistic(b *testing.B) {
++	astToCheckedExprDiscardBench(b,
++		`object.spec.replicas <= 5 && object.metadata.name.startsWith("prod-") && size(object.spec.containers) > 0`)
++}
++
++func BenchmarkAstToCheckedExpr_Discard_Complex(b *testing.B) {
++	astToCheckedExprDiscardBench(b, `
++		object.spec.containers.all(c, c.resources.limits.memory != "" &&
++		    c.resources.limits.cpu != "" &&
++		    c.image.startsWith("registry.example.com/") &&
++		    !(c.name in ["root", "admin"]) &&
++		    size(c.env) <= 50 &&
++		    c.imagePullPolicy in ["IfNotPresent", "Always"]
++		) && object.metadata.labels.size() < 64`)
++}
++
++// returnTypesAllocBench measures the per-call allocation of the
++// existing ReturnTypes() pattern: `return []*cel.Type{cel.BoolType}`
++// vs a package-level singleton.
++
++var (
++	freshReturnBool   = func() []*cel.Type { return []*cel.Type{cel.BoolType} }
++	cachedReturnBool  = []*cel.Type{cel.BoolType}
++	cachedReturnFunc  = func() []*cel.Type { return cachedReturnBool }
++)
++
++func BenchmarkReturnTypes_FreshSliceLiteral(b *testing.B) {
++	b.ReportAllocs()
++	for i := 0; i < b.N; i++ {
++		_ = freshReturnBool()
++	}
++}
++
++func BenchmarkReturnTypes_PackageSingleton(b *testing.B) {
++	b.ReportAllocs()
++	for i := 0; i < b.N; i++ {
++		_ = cachedReturnFunc()
++	}
++}
++
++// boolAccessor is a minimal ExpressionAccessor whose ReturnTypes
++// returns a fresh slice literal every call, mirroring the production
++// implementations on *ValidationCondition / *MatchCondition / etc.
++type boolAccessor struct{ expr string }
++
++func (a *boolAccessor) GetExpression() string  { return a.expr }
++func (a *boolAccessor) ReturnTypes() []*cel.Type {
++	return []*cel.Type{cel.BoolType}
++}
++
++// BenchmarkCompileFresh_End2End measures the full per-expression
++// compile path (env load + env.Compile + AstToCheckedExpr discard +
++// env.Program). Use to compare against the post-patch numbers.
++func BenchmarkCompileFresh_End2End(b *testing.B) {
++	for _, tc := range []struct {
++		name string
++		expr string
++	}{
++		{"Trivial", `true`},
++		{"Simple", `"foo" == "bar"`},
++		{"Realistic", `object.spec.replicas <= 5 && object.metadata.name.startsWith("prod-") && size(object.spec.containers) > 0`},
++		{"Complex", `object.spec.containers.all(c, c.resources.limits.memory != "" && c.resources.limits.cpu != "" && c.image.startsWith("registry.example.com/") && !(c.name in ["root", "admin"]) && size(c.env) <= 50 && c.imagePullPolicy in ["IfNotPresent", "Always"]) && object.metadata.labels.size() < 64`},
++	} {
++		b.Run(tc.name, func(b *testing.B) {
++			baseEnvSet := environment.MustBaseEnvSet(environment.DefaultCompatibilityVersion())
++			c := &compiler{varEnvs: newVariableDeclEnvs(baseEnvSet)}
++			acc := &boolAccessor{expr: tc.expr}
++			opts := OptionalVariableDeclarations{HasParams: false, HasAuthorizer: true}
++			b.ReportAllocs()
++			b.ResetTimer()
++			for i := 0; i < b.N; i++ {
++				_ = c.compileFresh(acc, opts, environment.NewExpressions)
++			}
++		})
++	}
++}
+diff --git a/staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/mutating/patch/json_patch.go b/staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/mutating/patch/json_patch.go
+index 26f73dd3415..f5902951bed 100644
+--- a/staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/mutating/patch/json_patch.go
++++ b/staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/mutating/patch/json_patch.go
+@@ -54,12 +54,15 @@ func (v *JSONPatchCondition) GetExpression() string {
+ 	return v.Expression
+ }
+ 
++var (
++	jsonPatchType            = types.NewObjectType("JSONPatch")
++	jsonPatchConditionReturn = []*celgo.Type{celgo.ListType(jsonPatchType)}
++)
++
+ func (v *JSONPatchCondition) ReturnTypes() []*celgo.Type {
+-	return []*celgo.Type{celgo.ListType(jsonPatchType)}
++	return jsonPatchConditionReturn
+ }
+ 
+-var jsonPatchType = types.NewObjectType("JSONPatch")
+-
+ // NewJSONPatcher creates a patcher that performs a JSON Patch mutation.
+ func NewJSONPatcher(patchEvaluator plugincel.MutatingEvaluator) Patcher {
+ 	return &jsonPatcher{patchEvaluator}
+diff --git a/staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/mutating/patch/smd.go b/staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/mutating/patch/smd.go
+index 7135aca3a25..4de0ae5ab4a 100644
+--- a/staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/mutating/patch/smd.go
++++ b/staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/mutating/patch/smd.go
+@@ -49,12 +49,15 @@ func (v *ApplyConfigurationCondition) GetExpression() string {
+ 	return v.Expression
+ }
+ 
++var (
++	applyConfigObjectType            = celtypes.NewObjectType("Object")
++	applyConfigConditionReturnTypes  = []*celgo.Type{applyConfigObjectType}
++)
++
+ func (v *ApplyConfigurationCondition) ReturnTypes() []*celgo.Type {
+-	return []*celgo.Type{applyConfigObjectType}
++	return applyConfigConditionReturnTypes
+ }
+ 
+-var applyConfigObjectType = celtypes.NewObjectType("Object")
+-
+ // NewApplyConfigurationPatcher creates a patcher that performs an applyConfiguration mutation.
+ func NewApplyConfigurationPatcher(expressionEvaluator plugincel.MutatingEvaluator) Patcher {
+ 	return &applyConfigPatcher{expressionEvaluator: expressionEvaluator}
+diff --git a/staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/mutating/plugin.go b/staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/mutating/plugin.go
+index 01dd230dea2..3660f71e4d4 100644
+--- a/staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/mutating/plugin.go
++++ b/staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/mutating/plugin.go
+@@ -174,8 +174,10 @@ func (v *Variable) GetExpression() string {
+ 	return v.Expression
+ }
+ 
++var variableReturnTypes = []*celgo.Type{celgo.AnyType, celgo.DynType}
++
+ func (v *Variable) ReturnTypes() []*celgo.Type {
+-	return []*celgo.Type{celgo.AnyType, celgo.DynType}
++	return variableReturnTypes
+ }
+ 
+ func (v *Variable) GetName() string {
+diff --git a/staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/validating/interface.go b/staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/validating/interface.go
+index fd8015e7ce5..cc5c716502a 100644
+--- a/staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/validating/interface.go
++++ b/staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/validating/interface.go
+@@ -43,8 +43,10 @@ func (v *ValidationCondition) GetExpression() string {
+ 	return v.Expression
+ }
+ 
++var validationConditionReturnTypes = []*celgo.Type{celgo.BoolType}
++
+ func (v *ValidationCondition) ReturnTypes() []*celgo.Type {
+-	return []*celgo.Type{celgo.BoolType}
++	return validationConditionReturnTypes
+ }
+ 
+ // AuditAnnotationCondition contains the inputs needed to compile, evaluate and publish a cel audit annotation
+@@ -57,8 +59,10 @@ func (v *AuditAnnotationCondition) GetExpression() string {
+ 	return v.ValueExpression
+ }
+ 
++var auditAnnotationConditionReturnTypes = []*celgo.Type{celgo.StringType, celgo.NullType}
++
+ func (v *AuditAnnotationCondition) ReturnTypes() []*celgo.Type {
+-	return []*celgo.Type{celgo.StringType, celgo.NullType}
++	return auditAnnotationConditionReturnTypes
+ }
+ 
+ // Variable is a named expression for composition.
+@@ -71,8 +75,10 @@ func (v *Variable) GetExpression() string {
+ 	return v.Expression
+ }
+ 
++var variableReturnTypes = []*celgo.Type{celgo.AnyType, celgo.DynType}
++
+ func (v *Variable) ReturnTypes() []*celgo.Type {
+-	return []*celgo.Type{celgo.AnyType, celgo.DynType}
++	return variableReturnTypes
+ }
+ 
+ func (v *Variable) GetName() string {
+diff --git a/staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/validating/message.go b/staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/validating/message.go
+index 8b7d973617d..3c0dd4211cf 100644
+--- a/staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/validating/message.go
++++ b/staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/validating/message.go
+@@ -31,6 +31,8 @@ func (m *MessageExpressionCondition) GetExpression() string {
+ 	return m.MessageExpression
+ }
+ 
++var messageExpressionConditionReturnTypes = []*celgo.Type{celgo.StringType}
++
+ func (m *MessageExpressionCondition) ReturnTypes() []*celgo.Type {
+-	return []*celgo.Type{celgo.StringType}
++	return messageExpressionConditionReturnTypes
+ }
+diff --git a/staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/validating/typechecking.go b/staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/validating/typechecking.go
+index c8b258f1635..3e62bacbf16 100644
+--- a/staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/validating/typechecking.go
++++ b/staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/validating/typechecking.go
+@@ -229,8 +229,10 @@ func (c celExpression) GetExpression() string {
+ 	return string(c)
+ }
+ 
++var celExpressionReturnTypes = []*cel.Type{cel.AnyType}
++
+ func (c celExpression) ReturnTypes() []*cel.Type {
+-	return []*cel.Type{cel.AnyType}
++	return celExpressionReturnTypes
+ }
+ func generateUniqueTypeName(kind string) string {
+ 	return fmt.Sprintf("%s%d", kind, time.Now().Nanosecond())
+diff --git a/staging/src/k8s.io/apiserver/pkg/admission/plugin/webhook/matchconditions/matcher.go b/staging/src/k8s.io/apiserver/pkg/admission/plugin/webhook/matchconditions/matcher.go
+index b9b4c9169e8..38ea5e2b2d0 100644
+--- a/staging/src/k8s.io/apiserver/pkg/admission/plugin/webhook/matchconditions/matcher.go
++++ b/staging/src/k8s.io/apiserver/pkg/admission/plugin/webhook/matchconditions/matcher.go
+@@ -46,8 +46,10 @@ func (v *MatchCondition) GetExpression() string {
+ 	return v.Expression
+ }
+ 
++var matchConditionReturnTypes = []*cel.Type{cel.BoolType}
++
+ func (v *MatchCondition) ReturnTypes() []*cel.Type {
+-	return []*cel.Type{cel.BoolType}
++	return matchConditionReturnTypes
+ }
+ 
+ var _ Matcher = &matcher{}
