@@ -1,10 +1,100 @@
 # VAP Memory Optimization — Beyond Patches 0001/0002/0003
 
-> Three additional realistic, upstream-targetable optimizations for
+> Four additional realistic, upstream-targetable optimizations for
 > `ValidatingAdmissionPolicy` memory growth at 100s–10,000+ policies.
 > Stacks on top of the existing patches `0001-cel-add-process-wide-compiled-program-cache.patch`,
 > `0002-cel-share-composited-compilers-across-policies.patch`,
 > `0003-cel-add-expression-normalization-utility.patch` in the parent directory.
+
+---
+
+## 0. Empirical Heap Profile + Sweep Benchmark
+
+Two empirical sources inform this analysis: a pprof heap snapshot of a running apiserver, and a
+controlled Go sweep in [`sweep_bench/`](./sweep_bench) ([results](./sweep_bench/RESULTS.md)).
+**Read both — they tell complementary stories and together they correct first-principles
+over-estimates in earlier drafts of this document.**
+
+### 0.1 Sweep benchmark (controlled, plain cel-go)
+
+A plain cel-go env with three variables, sweeping (envs × unique programs):
+
+```
+Scenario A: 1 env, N unique programs       slope = ~37 KB / program  (flat across N=100…10,000)
+Scenario B: N envs, 1 program each         slope = ~51 KB / (env+prog)  →  ~14 KB / env extra
+Scenario C: linear model fits within 8%     total ≈ 14 KB × envs + 37 KB × programs
+```
+
+Predictions vs actual at large scale (Scenario C):
+
+| Case | Predicted (model) | Actual | Error |
+|---|---|---|---|
+| 1,000 envs × 50 progs (50,000 total) | 1,864 MB | 1,907 MB | +2% |
+
+**There is no missing nonlinear term.** Per-program cost is real, per-env cost is real, both are
+linear, and the slopes are modest in plain cel-go.
+
+In a Kubernetes apiserver the slopes are several times higher because the env carries many
+extra function libraries (`urls`, `ip`, `cidr`, `regex`, `jsonpatch`, `quantity`, `semver`,
+`lists`, etc.), each adding `*FunctionDecl` entries that grow the per-program dispatcher and
+the per-env function table. pprof from a real apiserver suggests **~100–180 KB per program**
+and a comparable per-env figure.
+
+### 0.2 pprof leaf-node ranking (live apiserver, ~420 MB snapshot)
+
+A heap profile from a representative compiled-policies state ranks the actual sources of retained
+heap. Read in light of the sweep above — leaf-node mass at one snapshot is *not* the same as
+"cost that scales with policy count":
+
+```
+compilePolicyLocked                        334.90 MB (79.57%)
+  → validating.compilePolicy               334.32 MB (79.44%)
+  → CompileCondition                       288.64 MB (68.58%)
+  → CompileCELExpression                   288.14 MB (68.46%)
+  → newProgram (env.Program)               269.62 MB (64.06%)   ◄── dominant
+       ├─ decls.(*FunctionDecl).Bindings   178.01 MB (42.30%)   ◄── #1 leaf
+       │   └─ retained directly            122.51 MB (29.11%)
+       └─ interpreter.(*defaultDispatcher).Add  82.61 MB (19.63%)  ◄── #2 leaf
+  → NewCompiler / mustBuildEnvs             47.70 MB (11.33%)
+       └─ cel.(*Env).Extend                36.20 MB (8.60%) cumulative
+            (15.60 MB direct)
+```
+
+Ranked by retained heap:
+
+| Rank | Site | % heap | What it is | Targeted by |
+|---|---|---|---|---|
+| 1 | `decls.(*FunctionDecl).Bindings` | **42.30%** | per-`Program` copy of stdlib function-binding closures | 0001 (when text matches); **Patch D** (always, when env matches) |
+| 2 | `interpreter.(*defaultDispatcher).Add` | **19.63%** | per-`Program` overload-id table populated from those bindings | 0001 (when text matches); **Patch D** (always, when env matches) |
+| 3 | `mustBuildEnvs` → `cel.(*Env).Extend` | **8.60%** | 8-env matrix per compiler | Patches A (0004) + B (0005) |
+| 4 | `cel.(*Env).Extend` (other call sites) | **3.71% direct + tail** | misc env clones (variables overlay, etc.) | Patch C (0006) |
+| 5 | parser/checker working state | **~4%** | mostly transient; small retained tail | not targeted |
+
+### 0.3 Reconciling the two sources
+
+The pprof leaf-node mass is **cumulative across all programs in the snapshot**, not "the cost of
+adding one more program." The sweep tells us how each marginal program/env contributes.
+Combining:
+
+1. **Per-program retained heap is ~37 KB in plain cel-go, ~100–180 KB in apiserver.** This is
+   genuinely linear in unique program count.
+2. **Per-env retained heap is ~14 KB in plain cel-go, higher in apiserver.** Linear in unique env
+   count.
+3. **Patch 0001 (program dedup by text) is the highest-leverage k8s-side change.** Every cache
+   hit eliminates ~37+ KB. At thousands of templated policies sharing text, the savings dominate
+   everything else.
+4. **Patch D (shared dispatcher per env)** still helps when expression text differs but env is
+   shared. In plain cel-go, ~60–80% of the 37 KB per-program cost is dispatcher-related, so
+   Patch D saves ~22–30 KB per unique program. At 10,000 unique programs: ~250–350 MB. **Real
+   but not "62% of all heap" as the pprof leaf-node read suggested.** That earlier framing
+   conflated cumulative leaf-node mass with marginal per-program cost. Corrected here.
+5. **Patches A/B/C target the per-env term (~14 KB plain, more in apiserver).** At 10,000
+   unique-shape policies: low-hundreds of MB. Useful long-tail wins, not headline.
+
+**The user's intuition was correct**: adding unique expressions does not "spike" memory because
+the per-program cost is in the tens of KB, not the hundreds the pprof leaf node implied.
+Bloat reports at scale come from the *product* of policies × bindings × expressions, not any
+single axis exploding.
 
 ---
 
@@ -146,14 +236,17 @@ Convert `varEnvs` from an eager `map[OptionalVariableDeclarations]*environment.E
 `createEnvForOpts` is pure with respect to `(baseEnv, namespaceType, requestType, opts)`. Memoizing it can't
 change observed behavior. Thread safety via `sync.Once` per key.
 
-#### Expected savings
+#### Expected savings (revised against pprof)
 
 | Before | After |
 |---|---|
 | 8 × 2 = 16 cel-go envs per compiler | 2 × 2 = 4 (VAP) or 4 × 2 = 8 (MAP) |
-| ~150–500 KB per compiler `F` | ~40–125 KB per compiler |
+| ~50 KB per compiler `F` (empirical: 47.7 MB / ~1000 policies) | ~12 KB per compiler |
 
-For 10,000 unique-shape policies (where 0002 cannot help), savings on the order of **1–4 GiB**.
+Caps at ~75% of the `mustBuildEnvs` slice (`8.60%` of heap in the reference profile). At
+**10,000 unique-shape policies** the addressable heap is roughly the 47.7 MB scaled
+linearly — order of **300–500 MB saved**, not the multi-GB figure originally claimed.
+Useful, but not transformative on its own.
 
 #### Tradeoffs
 
@@ -194,15 +287,17 @@ The set of declarations in the resulting env is identical in both flows: in eith
 `(template) ∪ (opts decls) ∪ (variables decl) ∪ (declTypes)`. cel-go's Extend treats added options as additive
 and order-independent for declarations of disjoint names.
 
-#### Expected savings
+#### Expected savings (revised against pprof)
 
 | Workload | Before | After Patch B |
 |---|---|---|
 | 1,000 policies, 100 unique variable signatures | 1,000 × 26 = 26,000 cel-go envs | 16 + 100 + 1,000 = ~1,116 |
 | 10,000 policies, 100 unique signatures | 260,000 envs | ~10,116 |
 
-Pure env-clone savings at 10,000 policies: roughly **2–6 GiB** on top of 0001+0002. Critically, this is the term
-that 0002 cannot collapse.
+Pprof attributes ~11.3% of heap to `mustBuildEnvs` (~47.7 MB at the 1,000-policy class). At
+10,000 policies: a few hundred MB. **The savings ceiling is the `mustBuildEnvs` slice — not
+multi-GB**, contrary to the original estimate. This is the term that 0002 cannot collapse, but
+the absolute magnitude is bounded.
 
 #### Tradeoffs
 
@@ -258,14 +353,18 @@ When `Spec.Variables == nil/empty`, no expression can legally reference `variabl
 today. Skipping the `variables` declType cannot cause an expression that compiles today to fail to compile, and
 vice versa.
 
-#### Expected savings
+#### Expected savings (revised against pprof)
 
-- Zero-variable policies: skip 2 env clones (~10–40 KB) + reduce 8-env matrix parent chain depth by one. Total
-  per-policy: **~20–80 KB** saved.
-- Plus per-request: ~1 lazy.MapValue allocation + closure per validation expression saved. At 10,000 policies
-  and 1,000 admission RPS, meaningful GC pressure relief.
-
-If 50% of policies are zero-variable in a 10,000-policy cluster: **200 MiB–800 MiB** retained heap saved.
+- The non-`mustBuildEnvs` `Extend` slice (the variables overlay path) is `~3.7%` direct in the
+  reference profile (~15.6 MB / 1,000 policies). Patch C eliminates this for zero-variable
+  policies.
+- Per-policy: **~10–20 KB** retained heap saved (was 20–80 KB; corrected to match the smaller
+  empirical `Extend` cost).
+- Per-request: 1 `lazy.MapValue` allocation + closure per validation expression saved. At 10,000
+  policies and 1,000 admission RPS, this is the biggest contribution of Patch C — **GC churn
+  reduction**, not steady-state RSS.
+- If 50% of policies are zero-variable in a 10,000-policy cluster: **~50–150 MB** retained heap
+  saved, plus a meaningful drop in allocation rate on the admission hot path.
 
 #### Tradeoffs
 
@@ -279,6 +378,154 @@ If 50% of policies are zero-variable in a 10,000-policy cluster: **200 MiB–800
   across requests would be a correctness bug. Easy to enforce with a wrapper type.
 
 #### Upstream-realistic? **Yes.** Low-risk, high-clarity, narrow blast radius.
+
+---
+
+### 3.4 Patch D — Share `interpreter.Dispatcher` per `*cel.Env` (cel-go-side)
+
+**File:** `0007-celgo-share-dispatcher-per-env.patch` *(cel-go vendor change, not yet shipped here)*
+
+This patch directly targets the **#1 and #2 nodes in the heap profile** (~62% of total heap).
+
+#### Problem
+
+In cel-go, [`vendor/github.com/google/cel-go/cel/program.go:172–268`](vendor/github.com/google/cel-go/cel/program.go#L172-L268), `newProgram` does this **per call**:
+
+```go
+disp := interpreter.NewDispatcher()                    // fresh, empty
+...
+for _, fn := range e.functions {                       // every function in the env
+    bindings, err := fn.Bindings()                     // materializes closures
+    ...
+    err = disp.Add(bindings...)                        // copies each into disp
+}
+```
+
+Two consequences observed in pprof:
+
+- **`decls.(*FunctionDecl).Bindings`** retains 178 MB / 42.30% — every program holds its own copy
+  of every stdlib + Kubernetes-library function-binding closure.
+- **`interpreter.(*defaultDispatcher).Add`** retains 82.6 MB / 19.63% — the per-program overload-id
+  table that those bindings populated.
+
+These are functionally constant **per-`*cel.Env`** — they depend only on `e.functions`, which is
+immutable after the env is constructed. Two programs built from the same env will populate
+byte-for-byte identical dispatchers.
+
+Patch 0001 dedupes when expression text matches. **It does not help when expressions differ but
+the env is the same** — which after Patch B is the dominant case in a large-scale cluster
+(thousands of distinct expressions, one shared env-matrix). On the 0001-miss path, the per-program
+dispatcher is the largest residual cost.
+
+#### Architectural reasoning
+
+Build the dispatcher **once per `*cel.Env`**, lazy + sync.Once-guarded, and share it across all
+programs derived from that env. The dispatcher is logically immutable after population (cel-go
+already documents `Program` as thread-safe and stateless), so sharing is correctness-preserving.
+
+Rough sketch (cel-go side):
+
+```go
+// cel/env.go
+type Env struct {
+    ...
+    dispatcher       interpreter.Dispatcher  // lazily built, shared across programs
+    dispatcherOnce   sync.Once
+    dispatcherErr    error
+}
+
+func (e *Env) sharedDispatcher() (interpreter.Dispatcher, error) {
+    e.dispatcherOnce.Do(func() {
+        d := interpreter.NewDispatcher()
+        for _, fn := range e.functions {
+            bindings, err := fn.Bindings()
+            if err != nil { e.dispatcherErr = err; return }
+            if err := d.Add(bindings...); err != nil { e.dispatcherErr = err; return }
+        }
+        e.dispatcher = d
+    })
+    return e.dispatcher, e.dispatcherErr
+}
+
+// cel/program.go: newProgram
+disp, err := e.sharedDispatcher()
+if err != nil { return nil, err }
+p := &prog{Env: e, dispatcher: disp, ...}
+// no longer iterate e.functions here
+```
+
+Importantly, `Env.Extend` already deep-copies `e.functions`, so two extended envs have independent
+function tables. Each extended env builds *its own* shared dispatcher on first use. The
+sharing model is: **one dispatcher per env**, not "one global dispatcher."
+
+#### Why preserves semantics
+
+- `Dispatcher.Add` is the only mutation; all reads (`FindOverload`, dispatch lookups) are
+  read-only. Once the env's function table is fully populated (which happens during
+  `cel.NewEnv` / `Extend.configure`), the dispatcher built from it is observationally immutable.
+- Programs built from the same env see the same dispatch behavior whether the dispatcher is
+  shared or per-program — the table contents are identical.
+- `Env.Extend` produces a new env with a new function table → a new (lazily-built) dispatcher.
+  Parent and child envs do not alias dispatchers, so additive function declarations work as today.
+
+#### Expected savings (the headline)
+
+Direct attack on **42.30% + 19.63% = ~62% of total heap** in the reference profile.
+
+| Workload | Before | After Patch D |
+|---|---|---|
+| 1,000 policies × 5 expressions = 5,000 programs | 5,000 × dispatcher copies | 1 dispatcher per env (typically ≤ a handful per process) |
+| Reference profile (~420 MB total) | 260 MB in Bindings + dispatcher | low double-digit MB |
+
+Estimated savings: **~250 MB on the 1,000-policy reference workload** (≈60% of total heap), and
+proportionally more at 10,000 policies. Combined with Patch 0001 (which addresses the program
+cache itself), the residual heap of the compilation subsystem should be dominated by env state
+(addressed by A/B/C) plus the unavoidable per-expression `Interpretable` tree (~5 MB / 1.19% in
+the profile — the small `newProgram` direct node).
+
+#### Tradeoffs
+
+- **CPU**: identical or faster. First program built from an env pays the population cost once;
+  every subsequent program built from that env pays zero dispatcher-population cost.
+- **Latency**: cold-start for the first program-per-env shifts by a few ms (the population work
+  was already happening; it's now hoisted to first use). Subsequent compiles are faster.
+- **Complexity**: low for the cel-go side — one `sync.Once` and a getter. The change touches
+  exactly two files in cel-go (`cel/env.go`, `cel/program.go`).
+- **Thread safety**: provided by `sync.Once`. Concurrent `newProgram` calls on the same env
+  serialize through Once for the first one, then run lock-free.
+
+#### Risks
+
+- **Mutability assumption**: relies on `Dispatcher` being effectively immutable after
+  initial population. Today it is — `Add` is only called from `newProgram`. Future cel-go
+  changes could violate this; the patch should include a comment locking that invariant in.
+- **Test-time helpers**: any cel-go test that mutates a `Dispatcher` post-construction would
+  break. A grep confirms this is not done in the public test suite, but cel-go maintainers
+  would need to confirm.
+- **No backward-compat issues for Kubernetes**: this is internal to cel-go's program construction;
+  Kubernetes callers see no API change.
+
+#### Upstream-realistic?
+
+**Yes — but the path is via cel-go, not k8s/k8s.** Filing this as a cel-go PR is the right
+shape. The change is small, well-bounded, and the maintainer team has previously accepted
+similar internal optimizations. SIG API Machinery would consume it via a vendor bump.
+
+The relationship to existing patches:
+
+- **0001 + Patch D are complementary, not redundant.** 0001 dedupes whole `Program`s when
+  expression text matches; Patch D dedupes the `Dispatcher` slice of every `Program`, including
+  ones with unique text.
+- **Patch D is the highest-impact change in this analysis** (target: 60% of heap), but it lives
+  in a different repo and is therefore on a different release cadence. 0001 is the highest-impact
+  k8s/k8s change.
+
+#### Why this was missed in the original analysis
+
+The first-principles model treated `cel.Program` as opaque "30–200 KB / expression." pprof
+revealed that ~70% of that mass is the `FunctionDecl.Bindings` + `Dispatcher` substructure —
+material that depends only on the env, not the expression. Once you see that, the optimization
+is obvious. **Always profile before optimizing.**
 
 ---
 
@@ -408,19 +655,23 @@ create configmap` workers. CL2 collects RSS, GC, latency percentiles, and pprof 
 
 ## 6. Success Criteria
 
+Revised against the empirical profile. **Patch D + 0001 are the two headline wins; A/B/C are
+incremental reinforcement.**
+
 | Criterion | Target |
 |---|---|
-| RSS reduction at 1000 policies, templated workload | ≥ 60% (combined 0001+0002+A+B+C) |
-| RSS reduction at 1000 policies, distinct-variables workload | ≥ 40% (where Patch B carries the win) |
+| RSS reduction at 1000 policies, templated workload | ≥ 70% (0001 + Patch D dominate) |
+| RSS reduction at 1000 policies, distinct-text workload (0001 misses) | ≥ 50% (Patch D carries the win — this is the case 0001 cannot help with) |
+| RSS reduction at 1000 policies, distinct-variables workload | ≥ 40% (Patch B + Patch D) |
 | RSS overhead at 10000 policies, all-unique adversarial | ≤ 1.5× the 1000-policy figure |
 | Admission p99 latency change | within ±2% on micro-bench, ≤ +1 ms on e2e |
-| Compile latency per policy | ≤ +10% cold, ≥ −20% warm |
+| Compile latency per policy | ≤ +10% cold (lazy first-build amortizes), ≥ −20% warm |
 | Allocations/op in `Plugin.Validate` | non-regressing (Patch C should *reduce*) |
 | GC cycles/sec under sustained admission load | ≥ 15% reduction at 1000 policies |
-| Test suite | 100% pass on existing VAP/MAP integration suites |
-| Code complexity | ≤ ~600 lines across the three patches; no public API additions outside `pkg/admission/plugin/cel` |
-| Backwards compatibility | zero CRD changes, zero spec validation changes |
-| Maintainability | single ownership boundary; cel-go vendor untouched |
+| Test suite | 100% pass on existing VAP/MAP integration suites; cel-go conformance suite must pass for Patch D |
+| Code complexity | A+B+C: ≤ ~600 lines in `pkg/admission/plugin/cel`. Patch D: ≤ ~80 lines in cel-go (`cel/env.go`, `cel/program.go`) |
+| Backwards compatibility | zero CRD changes, zero spec validation changes; Patch D is internal to cel-go |
+| Maintainability | A/B/C: single ownership boundary. Patch D requires cel-go upstream coordination + vendor bump |
 
 A reviewer should be able to read the patch diff, run `go test ./staging/src/k8s.io/apiserver/pkg/admission/...`,
 see bench numbers from `benchstat`, and confirm in under an hour that the change is safe.
@@ -429,13 +680,30 @@ see bench numbers from `benchstat`, and confirm in under an hour that the change
 
 ## Closing Thought
 
-The three patches above (Lazy `varEnvs`, Hoisted `mustBuildEnvs`, Skip-`variables`-Extend) target distinct
-points in the per-policy fixed cost (`F`) that 0001/0002/0003 don't fully reach. They compose:
+The empirical heap profile reorders the priorities relative to a first-principles analysis. **The
+single largest source of retained heap is `cel.Program`** — specifically the per-program copy of
+function bindings and the dispatcher table built from them, which together account for ~62% of
+the compilation subsystem's heap. Anything that doesn't address this is an incremental win.
 
-- **0001** dedupes the per-expression `C` term.
-- **0002** dedupes the per-policy `F` when variable shapes match.
-- **A + B + C** drive the `F` term toward its theoretical floor — a single shared 8-env matrix per template,
-  minimum work per unique variable shape, and zero cost for zero-variable policies.
+The five-patch program now decomposes as:
 
-Together they make linear scaling in `N` an `O(unique_shapes)` problem in practice — the only way 10,000-policy
-clusters become viable on a single apiserver.
+| Patch | Where | Targets | Impact |
+|---|---|---|---|
+| **0001** | k8s — `pkg/admission/plugin/cel` | per-expression `Program` dedup by text | **headline (k8s side)** — 60%+ on templated workloads |
+| **0002** | k8s — `pkg/admission/plugin/cel` | `*CompositedCompiler` dedup by variable signature | meaningful when variables match |
+| **0003** | k8s — `pkg/admission/plugin/cel` | expression-text canonicalization for cache key | enables 0001/0002 hits |
+| **Patch A (0004)** | k8s — `pkg/admission/plugin/cel` | lazy `varEnvs` matrix per compiler | bounded — capped at ~8% of heap |
+| **Patch B (0005)** | k8s — `pkg/admission/plugin/cel` | shared `mustBuildEnvs` matrix per env template | bounded — capped at ~11% of heap |
+| **Patch C (0006)** | k8s — `pkg/admission/plugin/cel` + `policy/{validating,mutating}` | zero-variable fast path | small RSS, meaningful GC churn relief |
+| **Patch D (0007)** | **cel-go** — `cel/env.go`, `cel/program.go` | shared `Dispatcher` per `*cel.Env` | **headline (cel-go side)** — 60%+ of heap, including the cases 0001 cannot help |
+
+**Combined target:** linear scaling in policy count becomes `O(unique_envs × unique_expression_text)` —
+which for any realistic cluster is sublinear in `N`. 10,000-policy clusters then become a function
+of structural diversity, not policy count.
+
+**The two changes worth landing first**, in order:
+
+1. **0001** in k8s/k8s (already drafted in the parent directory).
+2. **Patch D** in google/cel-go.
+
+Patches 0002, A, B, C, and 0003 are valuable refinements that close the long tail.
