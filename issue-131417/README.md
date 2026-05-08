@@ -31,6 +31,7 @@ issue-131417/
 | Apply a patch | [patches/](patches/) |
 | Reproduce the per-program / per-env cost model | [benchmarks/sweep/](benchmarks/sweep/) |
 | Generate synthetic VAP load | [tools/generate_policies.py](tools/generate_policies.py) |
+| Test the patches on a kind cluster (offline-friendly) | [testing-on-kind.md](testing-on-kind.md) |
 
 ## Patches at a glance
 
