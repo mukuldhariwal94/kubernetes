@@ -20,6 +20,7 @@ import (
 	"sync"
 
 	"github.com/google/cel-go/common/ast"
+	"github.com/google/cel-go/common/decls"
 	"github.com/google/cel-go/common/types"
 	"github.com/google/cel-go/common/types/ref"
 	"github.com/google/cel-go/interpreter"
@@ -200,6 +201,15 @@ func newProgram(e *Env, a *ast.AST, opts []ProgramOption) (Program, error) {
 		}
 	}
 
+	// Add the function bindings created via Function() options.
+	// For type-checked ASTs, restrict bindings to the overloads actually
+	// referenced by this expression so fn.Bindings() (which allocates a new
+	// closure wrapper per overload) is only called for the ~5-15 functions the
+	// expression uses, not all ~80 registered functions.
+	if err := addNeededBindings(disp, e.functions, a); err != nil {
+		return nil, err
+	}
+
 	// Set the attribute factory after the options have been set.
 	var attrFactory interpreter.AttributeFactory
 	attrFactorOpts := []interpreter.AttrFactoryOption{
@@ -275,6 +285,86 @@ func (p *prog) initInterpretable(a *ast.AST, plannerOptions []interpreter.Planne
 		p.observable = oi
 	}
 	return p, nil
+}
+
+// addNeededBindings populates disp with function overload bindings.
+//
+// For type-checked ASTs it only calls fn.Bindings() for functions that have
+// at least one overload referenced in the expression's ReferenceMap, skipping
+// the ~150 functions whose closure wrappers would otherwise be allocated and
+// retained in the (now-released) dispatcher.
+//
+// Dispatch key mechanics:
+//   - Per-overload bindings: Overload.Operator == overload ID (e.g. "int_add_int")
+//   - Singleton bindings:    Overload.Operator == function name  (e.g. "_+_")
+//
+// The planner resolves calls by trying the overload ID first, then the function
+// name as fallback. Both cases are handled here.
+//
+// Falls back to binding all functions for unchecked (parse-only) ASTs.
+func addNeededBindings(disp interpreter.Dispatcher, functions map[string]*decls.FunctionDecl, a *ast.AST) error {
+	refMap := a.ReferenceMap()
+	if !a.IsChecked() || len(refMap) == 0 {
+		// Unchecked AST: bind everything (safe fallback).
+		for _, fn := range functions {
+			bindings, err := fn.Bindings()
+			if err != nil {
+				return err
+			}
+			if err = disp.Add(bindings...); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	// Step 1: collect overload IDs referenced in this expression.
+	usedOIDs := make(map[string]struct{}, len(refMap)*2)
+	for _, ref := range refMap {
+		for _, oID := range ref.OverloadIDs {
+			usedOIDs[oID] = struct{}{}
+		}
+	}
+
+	// Step 2: build overload-ID → function-name reverse index.
+	overloadToFnName := make(map[string]string, len(functions)*3)
+	for name, fn := range functions {
+		for _, o := range fn.OverloadDecls() {
+			overloadToFnName[o.ID()] = name
+		}
+	}
+
+	// Step 3: which function names have at least one referenced overload?
+	neededFns := make(map[string]struct{}, len(usedOIDs))
+	for oID := range usedOIDs {
+		if fnName, ok := overloadToFnName[oID]; ok {
+			neededFns[fnName] = struct{}{}
+		}
+	}
+
+	// Step 4: bind only the needed overloads.
+	for name, fn := range functions {
+		if _, needed := neededFns[name]; !needed {
+			continue
+		}
+		bindings, err := fn.Bindings()
+		if err != nil {
+			return err
+		}
+		for _, b := range bindings {
+			isSingleton := b.Operator == name
+			if isSingleton {
+				if err = disp.Add(b); err != nil {
+					return err
+				}
+			} else if _, used := usedOIDs[b.Operator]; used {
+				if err = disp.Add(b); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	return nil
 }
 
 // Eval implements the Program interface method.

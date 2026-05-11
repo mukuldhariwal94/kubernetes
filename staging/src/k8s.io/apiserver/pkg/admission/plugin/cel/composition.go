@@ -85,14 +85,7 @@ func NewCompositedCompiler(envSet *environment.EnvSet) (*CompositedCompiler, err
 		compiledVariables: map[string]CompilationResult{},
 	}
 
-	// Build a cached compiler keyed by the *base* env template (envSet),
-	// not the per-policy newEnvSet. Two CompositedCompilers built from the
-	// same template — i.e. the singleton getCompositionEnvTemplateWithStrictCost()
-	// in production — share entries in the process-wide program cache.
-	// Wire the per-policy variable signature provider so the cache key also
-	// differentiates between policies that declare different variable types.
-	baseCompiler := newCachedCompiler(state.EnvSet, envSet)
-	baseCompiler.variableSigFn = state.variableSignature
+	baseCompiler := NewCompiler(state.EnvSet)
 
 	conditionCompiler := &conditionCompiler{baseCompiler}
 	mutation := &mutatingCompiler{baseCompiler}

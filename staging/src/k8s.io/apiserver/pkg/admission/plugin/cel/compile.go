@@ -18,8 +18,7 @@ package cel
 
 import (
 	"fmt"
-	"strings"
-	"sync"
+	"sort"
 
 	"github.com/google/cel-go/cel"
 
@@ -30,6 +29,7 @@ import (
 	"k8s.io/apiserver/pkg/cel/environment"
 	"k8s.io/apiserver/pkg/cel/library"
 	"k8s.io/apiserver/pkg/cel/mutation"
+	"k8s.io/klog/v2"
 )
 
 const (
@@ -155,153 +155,19 @@ type Compiler interface {
 }
 
 type compiler struct {
-	varEnvs *variableDeclEnvs
-	// templateID identifies the env template (e.g. the singleton
-	// `getCompositionEnvTemplateWithStrictCost()`) that this compiler was
-	// derived from. Two compilers built from the same template are
-	// structurally equivalent for compilation purposes, so their compiled
-	// programs are interchangeable and may share cache entries.
-	//
-	// nil means "do not participate in the global program cache" — used by
-	// standalone NewCompiler callers (tests, webhook matchers) where the
-	// env may carry call-site-specific options (e.g. custom CostLimit) that
-	// must not bleed into other compilers' compilation results.
-	templateID *environment.EnvSet
-	// variableSigFn returns a structural signature of the in-scope composition
-	// variables at the time of compilation. It is wired by CompositedCompiler
-	// so that the program cache differentiates two policies whose conditions
-	// reference different variable types. nil for compilers used outside of
-	// the composition path (no "variables" identifier in scope).
-	variableSigFn func() string
+	varEnvs variableDeclEnvs
 }
 
-// NewCompiler returns a Compiler for the given env. The returned compiler is
-// not connected to the process-wide program cache (use NewCompositedCompiler
-// to opt in via a stable env template).
 func NewCompiler(env *environment.EnvSet) Compiler {
-	return &compiler{varEnvs: newVariableDeclEnvs(env)}
+	return &compiler{varEnvs: mustBuildEnvs(env)}
 }
 
-// newCachedCompiler returns a Compiler that participates in the process-wide
-// program cache. templateID must be a stable identity (typically the singleton
-// env template used to derive env). Internal helper for CompositedCompiler.
-func newCachedCompiler(env *environment.EnvSet, templateID *environment.EnvSet) *compiler {
-	return &compiler{
-		varEnvs:    newVariableDeclEnvs(env),
-		templateID: templateID,
-	}
-}
-
-// variableDeclEnvs lazily memoises the per-OptionalVariableDeclarations env
-// derived from a single base env. Replaces the old eager 8-entry map: in
-// production VAP only ever asks for 2 of the 8 combinations (and MAP for 4),
-// so eager construction was building 4-6 envs per compiler that nothing ever
-// looked up. Each saved env clone is ~4-6 KB retained + ~80-100 KB transient
-// allocation on apiserver-shaped templates.
-type variableDeclEnvs struct {
-	base          *environment.EnvSet
-	namespaceType *apiservercel.DeclType
-	requestType   *apiservercel.DeclType
-	cache         sync.Map // OptionalVariableDeclarations -> *envEntry
-}
-
-type envEntry struct {
-	once sync.Once
-	env  *environment.EnvSet
-	err  error
-}
-
-func newVariableDeclEnvs(base *environment.EnvSet) *variableDeclEnvs {
-	return &variableDeclEnvs{
-		base:          base,
-		namespaceType: cachedNamespaceType,
-		requestType:   cachedRequestType,
-	}
-}
-
-// get returns the env for the given OptionalVariableDeclarations, building it
-// on the first request and reusing it thereafter. Concurrent calls for the
-// same key serialize through sync.Once and observe the same env or err.
-func (v *variableDeclEnvs) get(opts OptionalVariableDeclarations) (*environment.EnvSet, error) {
-	actual, _ := v.cache.LoadOrStore(opts, &envEntry{})
-	e := actual.(*envEntry)
-	e.once.Do(func() {
-		e.env, e.err = createEnvForOpts(v.base, v.namespaceType, v.requestType, opts)
-	})
-	return e.env, e.err
-}
-
-// cachedNamespaceType / cachedRequestType are the (immutable) DeclTypes
-// previously built once per mustBuildEnvs call (= once per compiler). They
-// only depend on the static type definitions in BuildNamespaceType /
-// BuildRequestType, so they are safe to share across all compilers.
-var (
-	cachedNamespaceType = BuildNamespaceType()
-	cachedRequestType   = BuildRequestType()
-)
+type variableDeclEnvs map[OptionalVariableDeclarations]*environment.EnvSet
 
 // CompileCELExpression returns a compiled CEL expression.
 // perCallLimit was added for testing purpose only. Callers should always use const PerCallLimit from k8s.io/apiserver/pkg/apis/cel/config.go as input.
-//
-// Successful compilations are cached process-wide so that policies sharing
-// identical expression text reuse the same compiled cel.Program. The cache
-// key is a structural fingerprint of the expression and its compilation
-// inputs (see computeCompileCacheKey for details).
 func (c compiler) CompileCELExpression(expressionAccessor ExpressionAccessor, options OptionalVariableDeclarations, envType environment.Type) CompilationResult {
-	if expressionAccessor == nil {
-		return CompilationResult{}
-	}
-
-	// Compilers without a stable templateID do not share entries with the
-	// process-wide cache (this preserves correctness for standalone
-	// NewCompiler callers that may provide envs with call-site-specific
-	// program options like custom cost limits).
-	if c.templateID == nil {
-		return c.compileFresh(expressionAccessor, options, envType)
-	}
-
-	expr := expressionAccessor.GetExpression()
-	returnTypes := expressionAccessor.ReturnTypes()
-
-	// Only pay the cost of fetching the variable signature when the expression
-	// can possibly reference composition variables. This keeps the cache key
-	// small (and identical) for the common case of expressions that don't use
-	// the "variables" identifier.
-	var varSig string
-	if c.variableSigFn != nil && strings.Contains(expr, "variables") {
-		varSig = c.variableSigFn()
-	}
-
-	key := computeCompileCacheKey(c.templateID, expr, envType, options, returnTypes, varSig)
-
-	if cached, ok := compileCache().Get(key); ok {
-		if cr, ok := cached.(CompilationResult); ok && cr.Program != nil {
-			recordCacheHit()
-			// Rebind ExpressionAccessor to the caller's instance so downstream
-			// type assertions (e.g. *ValidationCondition, *MatchCondition)
-			// resolve against the right policy's metadata.
-			cr.ExpressionAccessor = expressionAccessor
-			return cr
-		}
-	}
-
-	cr := c.compileFresh(expressionAccessor, options, envType)
-	if cr.Error == nil && cr.Program != nil {
-		// Cache only successful compilations. ExpressionAccessor is omitted
-		// from the cached entry; it is rebound on each cache hit above.
-		compileCache().Add(key, CompilationResult{
-			Program:    cr.Program,
-			OutputType: cr.OutputType,
-		})
-	}
-	recordCacheMiss()
-	return cr
-}
-
-// compileFresh performs the underlying CEL compilation without consulting
-// the program cache. Extracted from the previous body of CompileCELExpression
-// so that the cache wrapper remains tidy.
-func (c compiler) compileFresh(expressionAccessor ExpressionAccessor, options OptionalVariableDeclarations, envType environment.Type) CompilationResult {
+	klog.InfoS("MD without caching")
 	resultError := func(errorString string, errType apiservercel.ErrorType, cause error) CompilationResult {
 		return CompilationResult{
 			Error: &apiservercel.Error{
@@ -313,11 +179,7 @@ func (c compiler) compileFresh(expressionAccessor ExpressionAccessor, options Op
 		}
 	}
 
-	envSet, err := c.varEnvs.get(options)
-	if err != nil {
-		return resultError(fmt.Sprintf("unexpected error loading CEL environment: %v", err), apiservercel.ErrorTypeInternal, nil)
-	}
-	env, err := envSet.Env(envType)
+	env, err := c.varEnvs[options].Env(envType)
 	if err != nil {
 		return resultError(fmt.Sprintf("unexpected error loading CEL environment: %v", err), apiservercel.ErrorTypeInternal, nil)
 	}
@@ -345,13 +207,14 @@ func (c compiler) compileFresh(expressionAccessor ExpressionAccessor, options Op
 		return resultError(reason, apiservercel.ErrorTypeInvalid, nil)
 	}
 
-	// Note: an AstToCheckedExpr defensive call used to live here. It walked
-	// the entire AST building a *exprpb.CheckedExpr proto tree (refMap +
-	// typeMap + recursive ExprToProto) and discarded the result. The only
-	// error case is `!ast.IsChecked()`, which is unreachable here because
-	// env.Compile above returned no issues. Removed to save 1-17 KiB of
-	// transient allocation per CompileCELExpression call (scales with AST
-	// node count).
+	_, err = cel.AstToCheckedExpr(ast)
+	if err != nil {
+		// should be impossible since env.Compile returned no issues
+		return resultError("unexpected compilation error: "+err.Error(), apiservercel.ErrorTypeInternal, nil)
+	}
+
+	logFunctionBindingAnalysis(env, ast, expressionAccessor.GetExpression())
+
 	prog, err := env.Program(ast,
 		cel.InterruptCheckFrequency(celconfig.CheckFrequency),
 	)
@@ -363,6 +226,34 @@ func (c compiler) compileFresh(expressionAccessor ExpressionAccessor, options Op
 		ExpressionAccessor: expressionAccessor,
 		OutputType:         ast.OutputType(),
 	}
+}
+
+func mustBuildEnvs(baseEnv *environment.EnvSet) variableDeclEnvs {
+	requestType := BuildRequestType()
+	namespaceType := BuildNamespaceType()
+	envs := make(variableDeclEnvs, 8) // since the number of variable combinations is small, pre-build a environment for each
+	for _, hasParams := range []bool{false, true} {
+		for _, hasAuthorizer := range []bool{false, true} {
+			var err error
+			{
+				decl := OptionalVariableDeclarations{HasParams: hasParams, HasAuthorizer: hasAuthorizer}
+				envs[decl], err = createEnvForOpts(baseEnv, namespaceType, requestType, decl)
+				if err != nil {
+					panic(err)
+				}
+				logEnvConfiguration(envs[decl], decl)
+			}
+			{
+				decl := OptionalVariableDeclarations{HasParams: hasParams, HasAuthorizer: hasAuthorizer, HasPatchTypes: true}
+				envs[decl], err = createEnvForOpts(baseEnv, namespaceType, requestType, decl)
+				if err != nil {
+					panic(err)
+				}
+				logEnvConfiguration(envs[decl], decl)
+			}
+		}
+	}
+	return envs
 }
 
 func createEnvForOpts(baseEnv *environment.EnvSet, namespaceType *apiservercel.DeclType, requestType *apiservercel.DeclType, opts OptionalVariableDeclarations) (*environment.EnvSet, error) {
@@ -415,4 +306,69 @@ var hasPatchTypes = environment.VersionedOptions{
 		common.ResolverEnvOption(&mutation.DynamicTypeResolver{}),
 		environment.UnversionedLib(library.JSONPatch), // for jsonPatch.escape() function
 	},
+}
+
+// logEnvConfiguration logs a one-time summary of a freshly-built CEL environment.
+func logEnvConfiguration(envSet *environment.EnvSet, opts OptionalVariableDeclarations) {
+	env, err := envSet.Env(environment.NewExpressions)
+	if err != nil {
+		return
+	}
+	fns := env.Functions()
+	totalOverloads := 0
+	for _, fn := range fns {
+		totalOverloads += len(fn.OverloadDecls())
+	}
+	vars := env.Variables()
+	varNames := make([]string, 0, len(vars))
+	for _, v := range vars {
+		varNames = append(varNames, v.Name())
+	}
+	sort.Strings(varNames)
+	fnNames := make([]string, 0, len(fns))
+	for name := range fns {
+		fnNames = append(fnNames, name)
+	}
+	sort.Strings(fnNames)
+	klog.InfoS("CEL env configured",
+		"hasParams", opts.HasParams,
+		"hasAuthorizer", opts.HasAuthorizer,
+		"hasPatchTypes", opts.HasPatchTypes,
+		"functions", len(fns),
+		"totalOverloads", totalOverloads,
+		"variables", varNames,
+		"libraries", env.Libraries(),
+		"functionNames", fnNames,
+	)
+}
+
+// logFunctionBindingAnalysis logs the ratio of overloads registered in the env vs.
+// overloads actually resolved by the type checker for the specific expression.
+func logFunctionBindingAnalysis(env *cel.Env, ast *cel.Ast, expr string) {
+	allFns := env.Functions()
+	totalOverloads := 0
+	for _, fn := range allFns {
+		totalOverloads += len(fn.OverloadDecls())
+	}
+
+	usedOverloads := make(map[string]struct{})
+	for _, ref := range ast.NativeRep().ReferenceMap() {
+		for _, oID := range ref.OverloadIDs {
+			usedOverloads[oID] = struct{}{}
+		}
+	}
+	used := make([]string, 0, len(usedOverloads))
+	for oID := range usedOverloads {
+		used = append(used, oID)
+	}
+	sort.Strings(used)
+
+	klog.InfoS("CEL function binding analysis",
+		"expression", expr,
+		"envFunctions", len(allFns),
+		"envOverloads", totalOverloads,
+		"usedOverloads", len(usedOverloads),
+		"wastedOverloads", totalOverloads-len(usedOverloads),
+		"usedOverloadIDs", used,
+	)
 }
