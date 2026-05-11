@@ -1,10 +1,23 @@
 # 0010 — Lazify per-compiler `varEnvs`, share request/namespace DeclTypes
 
-**Status:** prototype, applied to local working tree (not committed).
-**Side:** k8s (`staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/compile.go`).
+**Status:** ready (well-formed diff; `git apply` verified on top of 0001).
+**Side:** k8s (`staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/compile.go`
+plus a new benchmark in `policy/validating`).
 **Headline impact:** **~14× cut in per-policy compile-time allocation,
 ~24 % cut in per-policy retained heap**, with no change to public API
 or observable evaluation behaviour.
+
+**Prerequisite:** patch **0001** (process-wide compiled-program cache). The diff
+edits the `compiler` struct, `newCachedCompiler` and `compileFresh` introduced
+by 0001 and the `"strings"` import it adds, so it cannot apply to a bare master;
+apply 0001 first.
+
+**Mutually exclusive with patches 0004 + 0005.** 0010 and 0004 are two
+implementations of the same idea (lazy `varEnvs`) and both reshape the same
+region of `compile.go`; 0005 builds on 0004. Pick **either** `{0004 (+0005)}`
+**or** `{0010}` — never both. 0010 additionally hoists `BuildRequestType` /
+`BuildNamespaceType` into package-level singletons, which 0004 does not.
+(0010 is compatible with 0006, which doesn't touch `compile.go`.)
 
 ## What this patch is *not*
 
@@ -260,5 +273,8 @@ at the 10 000-policy mark.
 ## Apply
 
 ```
+git apply patches/0001-program-cache/0001-cel-add-process-wide-compiled-program-cache.patch
 git apply patches/0010-lazy-varenvs/0010-cel-lazify-per-compiler-varenvs.patch
 ```
+
+Do **not** also apply patch 0004 or 0005 — see the mutual-exclusion note above.

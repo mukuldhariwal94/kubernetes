@@ -1,6 +1,14 @@
 From: VAP scale optimization series
 Subject: [PATCH 0010] cel: lazify per-compiler varEnvs and share request/namespace DeclTypes
 
+Prerequisite: patch 0001 (process-wide compiled-program cache). This patch
+edits the compiler struct, newCachedCompiler and compileFresh that 0001
+introduces, plus the "strings" import it adds; apply 0001 first. It is the
+ALTERNATIVE to patch 0004 (and therefore incompatible with 0004 and with
+0005, which builds on 0004) -- both reshape the same varEnvs region of
+compile.go. 0010 additionally hoists BuildNamespaceType/BuildRequestType into
+process-wide singletons; 0004 does not. Pick one of {0004(+0005), 0010}.
+
 The per-compiler varEnvs map was constructed eagerly via mustBuildEnvs,
 which builds the full Cartesian product of OptionalVariableDeclarations
 combinations (HasParams x HasAuthorizer x HasPatchTypes = 8 entries).

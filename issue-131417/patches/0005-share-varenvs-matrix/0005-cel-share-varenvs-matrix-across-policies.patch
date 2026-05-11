@@ -1,70 +1,128 @@
+From 0cbb92f216c82c108b46846ca48bdf505d8a980d Mon Sep 17 00:00:00 2001
 From: VAP Memory Optimization <noreply@example.com>
-Subject: [PATCH] cel: hoist mustBuildEnvs to a process-wide template-keyed pool
+Date: Mon, 11 May 2026 19:59:12 +0530
+Subject: [PATCH] cel: hoist the varEnvs matrix to a process-wide
+ template-keyed pool
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
 
-Even after patches 0001/0002, policies whose `variables` signatures differ each
-recompute the 8-env `OptionalVariableDeclarations` matrix from scratch — 8
-cel-go env clones per compiler whose function/library/declType machinery is
-byte-for-byte identical across thousands of policies.
+Prerequisites: patch 0001 (process-wide compiled-program cache) and patch 0004
+(lazy per-compiler varEnvs). This patch builds on 0004's compiler.envFor and
+the compiler struct it reshaped; apply 0001 then 0004 then this. It is NOT
+compatible with patch 0010 (the alternative to 0004).
 
-This patch moves the per-(template, opts) env construction into a process-wide
-pool keyed by env template pointer, materialized lazily under sync.Once. The
-per-policy `variables` declaration is then applied as a thin Extend on top of
-the shared matrix entry.
+Even with 0001/0004, policies whose `variables` signatures differ each rebuild
+the per-OptionalVariableDeclarations env matrix from scratch -- cel-go env
+clones whose function/library/declType machinery is byte-for-byte identical
+across thousands of policies. With 0004 the matrix is per-compiler-lazy; this
+patch makes it process-wide-shared.
 
-Pre-patch flow:
-  template -> Extend({variables}) -> 8 EnvSet.Extend (per-policy)
-  = 9 Extends per policy; everything per-policy.
+  * compile_matrix_pool.go: a sharedVarEnvsPool keyed by env-template pointer,
+    lazily materializing each (template, opts) EnvSet under sync.Once and
+    caching it process-wide (matrixPoolCache).
+  * compile.go: compiler grows sharedMatrix and variablesOverlay fields. envFor
+    is refactored to memoize generically; the new buildEnv either pulls the
+    (opts) entry from the shared pool and Extends the per-policy `variables`
+    overlay on top, or -- for standalone NewCompiler -- builds from the
+    compiler's own base as before.
+  * composition.go: NewCompositedCompiler captures the `variables` overlay
+    declaratively, points the cached compiler at sharedMatrixForTemplate(envSet),
+    and wires the overlay. state.EnvSet still carries the variables-extended env
+    so callers that consult it directly are unaffected.
 
-Post-patch flow:
-  template -> 8 EnvSet.Extend (process-wide, shared) -> Extend({variables}) (per-policy)
-  = 8 + K + N Extends total, where K is the number of distinct variable
-  signatures across the cluster.
+The declaration set of the compilation env is unchanged: in both the old
+(template -> variables -> opts) and the new (template -> opts -> variables)
+orderings the final env is (template) ∪ (opts decls) ∪ (variables decl) ∪
+(declTypes), and cel-go treats added options as additive and order-independent
+for declarations of disjoint names (`variables` is disjoint from every opts
+variable name).
 
-The set of declarations in the resulting env is unchanged in either ordering:
-in both flows the final env contains
-  (template) ∪ (opts decls) ∪ (variables decl) ∪ (declTypes).
-cel-go treats added options as additive and order-independent for declarations
-of disjoint names, so the type-checked output is identical.
+Estimated savings: 2-6 GiB on a 10,000-policy cluster with ~100 distinct
+variable signatures (the matrix retained heap collapses from O(policies) to
+O(templates) -- one template in production).
 
-Stacks naturally on top of patch 0004 (Lazy varEnvs). Where 0004 made the
-matrix per-compiler-lazy, this patch makes it process-wide-shared.
-
-Estimated savings: 2–6 GiB on a 10,000-policy cluster with 100 distinct
-variable signatures.
-
+Tested:
+  go build  ./staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/... ./.../policy/...   OK
+  go vet    (same packages)                                                                OK
+  go test   ./staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/...                     PASS
+  go test   ./staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/...                  PASS
+  go test   ./staging/src/k8s.io/apiserver/pkg/cel/...                                      PASS
+  go test   ./staging/src/k8s.io/apiserver/pkg/admission/plugin/webhook/matchconditions/... PASS
 ---
- .../apiserver/pkg/admission/plugin/cel/compile.go      | 25 +++++++++++++++--
- .../pkg/admission/plugin/cel/compile_matrix_pool.go    | 80 ++++++++++++++++++
- .../apiserver/pkg/admission/plugin/cel/composition.go  | 18 +++++++++--
- 3 files changed, 117 insertions(+), 6 deletions(-)
+ .../pkg/admission/plugin/cel/compile.go       |  47 ++++++--
+ .../plugin/cel/compile_matrix_pool.go         | 103 ++++++++++++++++++
+ .../pkg/admission/plugin/cel/composition.go   |  35 ++++--
+ 3 files changed, 169 insertions(+), 16 deletions(-)
+ create mode 100644 staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/compile_matrix_pool.go
 
 diff --git a/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/compile.go b/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/compile.go
+index 3bb097d9c80..89adfe9ccea 100644
 --- a/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/compile.go
 +++ b/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/compile.go
-@@ -154,6 +154,12 @@ type Compiler interface {
+@@ -155,11 +155,23 @@ type Compiler interface {
  }
-
+ 
  type compiler struct {
-+	// sharedMatrix, when non-nil, indicates this compiler delegates per-(opts)
-+	// env construction to the process-wide pool keyed by templateID. The
-+	// per-policy variables declaration (if any) is applied on top of the
-+	// shared entry inside envFor.
+-	// base / namespace / request feed lazy varEnvs construction.
++	// sharedMatrix, when non-nil, makes envFor source the per-(opts) EnvSet
++	// from a process-wide pool keyed by env template (see compile_matrix_pool.go)
++	// instead of building it from this compiler's own base. The per-policy
++	// `variables` declaration, if any, is applied on top via variablesOverlay.
 +	sharedMatrix *sharedVarEnvsPool
 +
- 	// base / namespace / request feed lazy varEnvs construction.
++	// base / namespace / request feed per-compiler varEnvs construction when
++	// sharedMatrix is nil (the standalone NewCompiler path).
  	base      *environment.EnvSet
  	namespace *apiservercel.DeclType
-@@ -188,6 +194,9 @@ type compiler struct {
- 	// composition path (no "variables" identifier in scope).
- 	variableSigFn func() string
-+
-+	// variablesOverlay carries the per-policy `variables` declaration that
-+	// must be Extended on top of any shared matrix entry. nil for policies
-+	// with no variables (see patch 0006).
+ 	request   *apiservercel.DeclType
+ 
++	// variablesOverlay carries the per-policy `variables` declaration that must
++	// be Extended on top of a shared matrix entry. nil for compilers with no
++	// `variables` in scope (NewCompiler; NewSimpleCompiler from patch 0006).
 +	variablesOverlay *environment.VersionedOptions
++
+ 	// envs holds the per-OptionalVariableDeclarations EnvSets materialized so
+ 	// far; once populated for a key, it is never invalidated for the lifetime
+ 	// of the compiler. Access for a missing key is gated by once[key] so that
+@@ -215,11 +227,12 @@ func newCachedCompiler(env *environment.EnvSet, templateID *environment.EnvSet)
  }
-
- func (c *compiler) envFor(opts OptionalVariableDeclarations) (*environment.EnvSet, error) {
+ 
+ // envFor returns the EnvSet for the given OptionalVariableDeclarations,
+-// constructing it on first use. Concurrent callers requesting the same key
+-// share one construction via sync.Once; concurrent callers requesting
+-// different keys make progress independently. Replaces the eager 8-entry
+-// matrix that mustBuildEnvs used to materialize for every compiler — in
+-// production VAP only ever asks for 2 of those 8 combinations and MAP for 4.
++// constructing it on first use and memoizing it for the lifetime of the
++// compiler. Concurrent callers requesting the same key share one construction
++// via sync.Once; concurrent callers requesting different keys make progress
++// independently. Replaces the eager 8-entry matrix that mustBuildEnvs used to
++// materialize for every compiler — in production VAP only ever asks for 2 of
++// those 8 combinations and MAP for 4.
+ func (c compiler) envFor(opts OptionalVariableDeclarations) (*environment.EnvSet, error) {
+ 	if v, ok := c.envs.Load(opts); ok {
+ 		return v.(*environment.EnvSet), nil
+@@ -227,7 +240,7 @@ func (c compiler) envFor(opts OptionalVariableDeclarations) (*environment.EnvSet
+ 	onceI, _ := c.once.LoadOrStore(opts, &sync.Once{})
+ 	var buildErr error
+ 	onceI.(*sync.Once).Do(func() {
+-		es, err := createEnvForOpts(c.base, c.namespace, c.request, opts)
++		es, err := c.buildEnv(opts)
+ 		if err != nil {
+ 			buildErr = err
+ 			return
+@@ -245,6 +258,26 @@ func (c compiler) envFor(opts OptionalVariableDeclarations) (*environment.EnvSet
+ 	return v.(*environment.EnvSet), nil
+ }
+ 
++// buildEnv constructs the EnvSet for opts. When the compiler is wired to a
++// process-wide matrix pool it reuses the shared (template, opts) entry and
++// Extends the per-policy `variables` overlay (if any) on top — so two policies
++// whose only difference is their `variables` declarations still share the
++// underlying matrix. Otherwise it builds the entry from this compiler's own
++// base env (the standalone NewCompiler path).
++func (c compiler) buildEnv(opts OptionalVariableDeclarations) (*environment.EnvSet, error) {
 +	if c.sharedMatrix != nil {
 +		shared, err := c.sharedMatrix.envFor(opts)
 +		if err != nil {
@@ -73,23 +131,34 @@ diff --git a/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/compile.go b/
 +		if c.variablesOverlay == nil {
 +			return shared, nil
 +		}
-+		// Apply the per-policy variables overlay on top of the shared entry.
-+		// This single Extend is the only per-policy work in the env path.
 +		return shared.Extend(*c.variablesOverlay)
 +	}
++	return createEnvForOpts(c.base, c.namespace, c.request, opts)
++}
 +
-+	// Fallback: per-compiler-only lazy table (patch 0004 path).
- 	if v, ok := c.envs.Load(opts); ok {
- 		return v.(*environment.EnvSet), nil
- 	}
+ // CompileCELExpression returns a compiled CEL expression.
+ // perCallLimit was added for testing purpose only. Callers should always use const PerCallLimit from k8s.io/apiserver/pkg/apis/cel/config.go as input.
+ //
 diff --git a/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/compile_matrix_pool.go b/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/compile_matrix_pool.go
 new file mode 100644
+index 00000000000..3a120d6d113
 --- /dev/null
 +++ b/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/compile_matrix_pool.go
-@@ -0,0 +1,80 @@
+@@ -0,0 +1,103 @@
 +/*
 +Copyright 2026 The Kubernetes Authors.
-+Licensed under the Apache License, Version 2.0.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
 +*/
 +
 +package cel
@@ -101,17 +170,20 @@ new file mode 100644
 +	"k8s.io/apiserver/pkg/cel/environment"
 +)
 +
-+// sharedVarEnvsPool is a process-wide cache of the 8-entry
-+// OptionalVariableDeclarations matrix, keyed by env-template pointer identity.
++// sharedVarEnvsPool is a process-wide cache of the per-OptionalVariableDeclarations
++// EnvSet matrix, keyed by env-template pointer identity.
 +//
 +// Two policies built from the same env template share the same matrix
-+// regardless of their `variables` declarations. Per-policy variables are
-+// applied as a thin Extend on top of the shared entry inside compiler.envFor.
++// regardless of their `variables` declarations; the per-policy `variables`
++// overlay (if any) is applied as a thin Extend on top of the shared entry
++// inside compiler.envFor. Without this pool every CompositedCompiler rebuilds
++// the full HasParams x HasAuthorizer x HasPatchTypes matrix from scratch even
++// though the function/library/declType machinery underneath is byte-for-byte
++// identical across thousands of policies.
 +//
-+// Pointer identity is sufficient because the only production caller is the
-+// `sync.Once`-guarded singleton in the validating plugin
-+// (`getCompositionEnvTemplateWithStrictCost()`); tests that build per-test
-+// templates accumulate small entries with no correctness risk.
++// Pointer identity is sufficient because the only production caller passes the
++// sync.Once-guarded singleton getCompositionEnvTemplateWithStrictCost(); tests
++// that build per-test templates accumulate small, harmless extra entries.
 +type sharedVarEnvsPool struct {
 +	base      *environment.EnvSet
 +	namespace *apiservercel.DeclType
@@ -121,9 +193,8 @@ new file mode 100644
 +	once sync.Map // OptionalVariableDeclarations -> *sync.Once
 +}
 +
-+var (
-+	matrixPoolCache sync.Map // *environment.EnvSet (template) -> *sharedVarEnvsPool
-+)
++// matrixPoolCache maps an env template pointer to its sharedVarEnvsPool.
++var matrixPoolCache sync.Map // *environment.EnvSet (template) -> *sharedVarEnvsPool
 +
 +// sharedMatrixForTemplate returns the (lazily-initialized) pool keyed by the
 +// given template pointer. Safe for concurrent use.
@@ -141,6 +212,8 @@ new file mode 100644
 +}
 +
 +// envFor returns the shared (template, opts) EnvSet, materializing it once.
++// Concurrent callers requesting the same opts share one construction via
++// sync.Once; callers requesting different opts make progress independently.
 +func (p *sharedVarEnvsPool) envFor(opts OptionalVariableDeclarations) (*environment.EnvSet, error) {
 +	if v, ok := p.envs.Load(opts); ok {
 +		return v.(*environment.EnvSet), nil
@@ -163,8 +236,8 @@ new file mode 100644
 +	return v.(*environment.EnvSet), nil
 +}
 +
-+// SharedMatrixSizeForTests reports the number of materialized entries in the
-+// matrix for the given template. Test-only.
++// SharedMatrixSizeForTests reports the number of materialized matrix entries
++// for the given template. Test-only.
 +func SharedMatrixSizeForTests(template *environment.EnvSet) int {
 +	v, ok := matrixPoolCache.Load(template)
 +	if !ok {
@@ -176,44 +249,62 @@ new file mode 100644
 +	return count
 +}
 diff --git a/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/composition.go b/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/composition.go
+index 7e7ddf69651..0351c691d95 100644
 --- a/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/composition.go
 +++ b/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/composition.go
-@@ -65,11 +65,12 @@ type CompositedEvaluator struct {
- }
-
+@@ -66,7 +66,19 @@ type CompositedEvaluator struct {
  func NewCompositedCompiler(envSet *environment.EnvSet) (*CompositedCompiler, error) {
  	newMapType := apiservercel.NewObjectType(variablesTypeName, map[string]*apiservercel.DeclField{})
--
+ 
 -	newEnvSet, err := envSet.Extend(environment.VersionedOptions{
-+	// Capture the variables overlay declaratively rather than eagerly extending.
-+	// The compiler will apply it on top of the shared (template, opts) matrix
-+	// entry inside envFor, so two policies whose only difference is their
-+	// `variables` declarations still share the underlying 8-env matrix.
++	// The per-policy `variables` overlay. The composition state keeps an env
++	// with this overlay applied (state.EnvSet, consulted by callers that touch
++	// CompositedCompiler.Env / compositionState directly), but the env actually
++	// used to compile expressions is sourced from the process-wide (template,
++	// opts) matrix pool with this same overlay applied lazily on top — so the
++	// expensive HasParams x HasAuthorizer x HasPatchTypes matrix is built once
++	// per env template instead of once per policy.
++	//
++	// The set of declarations in the compilation env is unchanged either way:
++	// (template) ∪ (opts decls) ∪ (variables decl) ∪ (declTypes). cel-go treats
++	// added options as additive and order-independent for declarations of
++	// disjoint names, and `variables` is disjoint from every opts var name.
 +	variablesOverlay := environment.VersionedOptions{
  		IntroducedVersion: version.MajorMinor(1, 0),
  		EnvOptions: []cel.EnvOption{
  			cel.Variable("variables", newMapType.CelType()),
- 		},
+@@ -74,7 +86,9 @@ func NewCompositedCompiler(envSet *environment.EnvSet) (*CompositedCompiler, err
  		DeclTypes: []*apiservercel.DeclType{
  			newMapType,
  		},
 -	})
--	if err != nil {
--		return nil, err
++	}
++
++	newEnvSet, err := envSet.Extend(variablesOverlay)
+ 	if err != nil {
+ 		return nil, err
  	}
-
- 	state := &compositionState{
- 		mapType:           newMapType,
--		EnvSet:            newEnvSet,
-+		EnvSet:            envSet, // base; the per-policy variables overlay is on the compiler
+@@ -85,13 +99,16 @@ func NewCompositedCompiler(envSet *environment.EnvSet) (*CompositedCompiler, err
  		compiledVariables: map[string]CompilationResult{},
  	}
-
- 	// The cached compiler now uses the shared matrix pool keyed by envSet
- 	// (the template). The variables overlay is applied per-call inside envFor.
- 	baseCompiler := newCachedCompiler(envSet, envSet)
+ 
+-	// Build a cached compiler keyed by the *base* env template (envSet),
+-	// not the per-policy newEnvSet. Two CompositedCompilers built from the
+-	// same template — i.e. the singleton getCompositionEnvTemplateWithStrictCost()
+-	// in production — share entries in the process-wide program cache.
+-	// Wire the per-policy variable signature provider so the cache key also
+-	// differentiates between policies that declare different variable types.
+-	baseCompiler := newCachedCompiler(state.EnvSet, envSet)
++	// Build a cached compiler keyed by the *base* env template (envSet), not
++	// the per-policy newEnvSet. Two CompositedCompilers built from the same
++	// template — i.e. the singleton getCompositionEnvTemplateWithStrictCost()
++	// in production — therefore share both the process-wide program cache and
++	// the shared env matrix pool. Wire the per-policy variable signature
++	// provider so the program cache key still differentiates policies that
++	// declare different variable types.
++	baseCompiler := newCachedCompiler(envSet, envSet)
 +	baseCompiler.sharedMatrix = sharedMatrixForTemplate(envSet)
 +	baseCompiler.variablesOverlay = &variablesOverlay
  	baseCompiler.variableSigFn = state.variableSignature
-
+ 
  	conditionCompiler := &conditionCompiler{baseCompiler}

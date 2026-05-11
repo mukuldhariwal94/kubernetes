@@ -3,6 +3,11 @@ From: mukul dhariwal <mukul.dhariwal94@gmail.com>
 Date: Thu, 7 May 2026 20:23:57 +0530
 Subject: [PATCH 8/9] cel: shrink process-wide compile-cache cap to 1500
 
+Prerequisite: patch 0001 (process-wide compiled-program cache). This patch
+only tweaks the defaultCompileCacheSize constant and its doc comment in
+compile_cache.go, which 0001 creates -- so it cannot be applied to a bare
+master, only on top of 0001. Apply 0001 first.
+
 Heap profiles from a real apiserver (issue-131417, snapshot at 1.7 GB
 inuse) show the cel.Program retained per cache entry is ~150-250 KB
 once you account for the per-program FunctionDecl.Bindings copy and

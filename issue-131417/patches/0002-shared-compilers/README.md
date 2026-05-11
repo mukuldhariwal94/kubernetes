@@ -1,9 +1,17 @@
 # 0002 — Process-wide `CompositedCompiler` reuse
 
-**Status:** drafted, not yet upstream.
-**Side:** k8s (`staging/src/k8s.io/apiserver/pkg/admission/plugin/cel`).
+**Status:** ready (applies cleanly on bare master; `git apply` verified).
+**Side:** k8s (`staging/src/k8s.io/apiserver/pkg/admission/plugin/cel` +
+`policy/{validating,mutating}`).
 **Headline impact:** meaningful when policies share variable shapes;
 collapses the per-policy fixed `F` term in the memory model.
+
+**Base:** bare master (no prerequisite).
+**Overlaps with patch 0006:** both rewrite the `compilePolicy` functions in
+`policy/validating/plugin.go` and `policy/mutating/compilation.go`, so the two
+patches do **not** apply on top of each other without a manual merge of that
+region. Pick one, or merge the `compilePolicy` change by hand if you want both.
+(Independent of 0001, 0003, 0004, 0005, 0009, 0010, 0011, 0012.)
 
 ## What it does
 

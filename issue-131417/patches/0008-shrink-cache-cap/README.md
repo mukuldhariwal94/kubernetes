@@ -1,8 +1,13 @@
 # 0008 — Shrink process-wide compile-cache cap to 1500
 
-**Status:** drafted, applied to local branch (commit `1c91ba1`).
+**Status:** ready (well-formed diff; `git apply` verified on top of 0001).
 **Side:** k8s (`staging/src/k8s.io/apiserver/pkg/admission/plugin/cel`).
 **Headline impact:** caps cache footprint at ~300–400 MB (was ~1 GB).
+
+**Prerequisite:** patch **0001** (process-wide compiled-program cache). This
+patch only changes the `defaultCompileCacheSize` constant and its doc comment
+in `compile_cache.go` — a file that **0001 creates**. It therefore cannot apply
+to a bare master; apply 0001 first. (Independent of every other patch.)
 
 ## Problem
 
@@ -44,6 +49,7 @@ viable since each entry would retain ~30–50 KB instead of ~200 KB).
 ## Apply
 
 ```
+git apply patches/0001-program-cache/0001-cel-add-process-wide-compiled-program-cache.patch
 git apply patches/0008-shrink-cache-cap/0008-cel-shrink-process-wide-compile-cache-cap-to-1500.patch
 ```
 
