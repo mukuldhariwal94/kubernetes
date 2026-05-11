@@ -97,16 +97,16 @@ export const memoryObjects = [
     name: 'Base EnvSet',
     owner: 'Kubernetes CEL environment package',
     phase: 'persistent',
-    stores: 'libraries, declarations, cost options, compatibility version',
-    allocation: 'Built once per compatibility version; Extend is intentionally avoided at request time.',
+    stores: 'standard libraries, Kubernetes libraries, declarations, parser/checker options, cost options, compatibility version',
+    allocation: 'Heavy retained object graph. Built once per compatibility version because EnvSet extension allocates a lot and should stay off the request path.',
     reuse: 'process-wide',
   },
   {
     name: 'cel.Env',
     owner: 'cel-go',
     phase: 'persistent',
-    stores: 'parser, checker config, declarations, macros, program options, shared dispatcher',
-    allocation: 'Environment construction is compile-time only. The shared dispatcher cache saves repeated program memory.',
+    stores: 'parser, checker config, declarations, macros, provider/adapter, program options, shared dispatcher cache',
+    allocation: 'One of the biggest persistent memory holders. Kubernetes memoizes optional-variable env variants so each compile does not rebuild declarations and dispatch tables.',
     reuse: 'per env template / optional variable set',
   },
   {
@@ -122,7 +122,7 @@ export const memoryObjects = [
     owner: 'cel-go program',
     phase: 'persistent',
     stores: 'dispatcher, interpreter, interpretable tree, attribute factory, cost estimator',
-    allocation: 'Kubernetes comments estimate roughly 150-250 KB retained per cached program.',
+    allocation: 'Kubernetes comments estimate roughly 150-250 KB retained per cached program; shared Env dispatcher avoids paying much of that again.',
     reuse: 'per compiled expression until policy changes or cache evicts',
   },
   {
@@ -395,3 +395,22 @@ export const mermaidMemory = `flowchart TB
   act --> interp
   interp --> details
 `;
+
+export const envPressureFacts = [
+  {
+    label: 'Why it feels large',
+    value: 'EnvSet / cel.Env retain declarations, functions, libraries, parser and checker setup, provider/adapter state, program options, and a shared dispatcher.',
+  },
+  {
+    label: 'What Kubernetes optimizes',
+    value: 'Base EnvSets are cached by compatibility version, and optional-variable declaration envs are memoized instead of rebuilt for every expression.',
+  },
+  {
+    label: 'Where cel-go helps',
+    value: 'cel.Env has a sharedDispatcher cache so programs can share overload tables rather than each retaining a full dispatcher graph.',
+  },
+  {
+    label: 'What not to do',
+    value: 'Do not build or extend environments on every admission request. Compile once, reuse programs, and only create activations per request.',
+  },
+];

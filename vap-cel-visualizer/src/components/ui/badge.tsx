@@ -4,11 +4,11 @@ import { cn } from '../../lib/utils';
 type BadgeTone = 'cyan' | 'green' | 'amber' | 'rose' | 'slate';
 
 const tones: Record<BadgeTone, string> = {
-  cyan: 'border-cyan-400/30 bg-cyan-400/10 text-cyan-200',
-  green: 'border-green-400/30 bg-green-400/10 text-green-200',
-  amber: 'border-amber-400/30 bg-amber-400/10 text-amber-200',
-  rose: 'border-rose-400/30 bg-rose-400/10 text-rose-200',
-  slate: 'border-slate-500/30 bg-slate-800 text-slate-200',
+  cyan: 'border-aqua/35 bg-aqua/12 text-orange-100',
+  green: 'border-mint/35 bg-mint/12 text-lime-100',
+  amber: 'border-amber/35 bg-amber/12 text-amber-100',
+  rose: 'border-rose/35 bg-rose/12 text-red-100',
+  slate: 'border-stone-500/30 bg-stone-900 text-stone-200',
 };
 
 export function Badge({

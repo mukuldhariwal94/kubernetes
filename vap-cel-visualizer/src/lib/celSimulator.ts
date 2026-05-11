@@ -589,8 +589,8 @@ function buildAllocationRows(requestAllocBytes: number, transientAllocBytes: num
       name: 'cel.Env / EnvSet',
       phase: 'persistent',
       lifetime: 'Process-wide base env and per-template env variants',
-      estimate: 'expensive to extend; intentionally reused',
-      note: 'Kubernetes memoizes base environments and optional variable declaration envs.',
+      estimate: 'large retained graph; bigger strategic target than per-request activation',
+      note: 'Kubernetes memoizes base environments and optional variable declaration envs because rebuilding declarations, libraries, and dispatch tables is expensive.',
     },
     {
       name: 'evaluationActivation',

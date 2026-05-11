@@ -6,17 +6,17 @@ export default {
   theme: {
     extend: {
       colors: {
-        ink: '#080b10',
-        panel: '#0d121a',
-        panel2: '#121925',
-        line: '#273243',
-        mint: '#4ade80',
-        aqua: '#22d3ee',
-        amber: '#fbbf24',
-        rose: '#fb7185',
+        ink: '#11100e',
+        panel: '#191713',
+        panel2: '#211f1a',
+        line: '#3c352c',
+        mint: '#8aa36f',
+        aqua: '#d97757',
+        amber: '#d09a4f',
+        rose: '#cf6f6b',
       },
       boxShadow: {
-        glow: '0 0 28px rgba(34, 211, 238, 0.18)',
+        glow: '0 0 34px rgba(217, 119, 87, 0.18)',
       },
       fontFamily: {
         mono: ['JetBrains Mono', 'SFMono-Regular', 'Menlo', 'monospace'],

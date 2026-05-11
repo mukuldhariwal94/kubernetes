@@ -6,7 +6,6 @@ import mermaid from 'mermaid';
 import { AnimatePresence, motion } from 'framer-motion';
 import {
   Activity,
-  ArrowRight,
   Binary,
   Boxes,
   Braces,
@@ -41,6 +40,7 @@ import {
   admissionFlowNodes,
   compileStages,
   dispatcherRows,
+  envPressureFacts,
   memoryObjects,
   mermaidCompile,
   mermaidMemory,
@@ -55,7 +55,6 @@ import {
   nodeKindTone,
   sampleExpression,
   type AllocationRow,
-  type CelNode,
   type EvaluationOutput,
   type EvaluationStep,
 } from './lib/celSimulator';
@@ -262,9 +261,9 @@ function PipelineSection() {
     },
     style: {
       width: 190,
-      background: node.id === 'vap' ? '#123022' : '#121925',
-      border: node.id === 'decision' ? '1px solid #4ade80' : '1px solid #273243',
-      color: '#e2e8f0',
+      background: node.id === 'vap' ? '#24291c' : '#211f1a',
+      border: node.id === 'decision' ? '1px solid #8aa36f' : '1px solid #3c352c',
+      color: '#ece4d8',
       padding: 10,
     },
   }));
@@ -273,8 +272,8 @@ function PipelineSection() {
     source,
     target,
     animated: index > 5,
-    markerEnd: { type: MarkerType.ArrowClosed, color: '#22d3ee' },
-    style: { stroke: index > 5 ? '#22d3ee' : '#64748b', strokeWidth: 2 },
+    markerEnd: { type: MarkerType.ArrowClosed, color: '#d97757' },
+    style: { stroke: index > 5 ? '#d97757' : '#8b7c68', strokeWidth: 2 },
   }));
 
   return (
@@ -288,7 +287,7 @@ function PipelineSection() {
       <div className="grid gap-4 lg:grid-cols-[1fr_360px]">
         <Card className="h-[430px] overflow-hidden">
           <ReactFlow nodes={nodes} edges={edges} fitView minZoom={0.35} maxZoom={1.2}>
-            <MiniMap pannable zoomable nodeColor={(node) => (node.id === 'vap' ? '#4ade80' : '#22d3ee')} />
+            <MiniMap pannable zoomable nodeColor={(node) => (node.id === 'vap' ? '#8aa36f' : '#d97757')} />
             <Controls />
           </ReactFlow>
         </Card>
@@ -301,7 +300,7 @@ function PipelineSection() {
           ].map(([n, title, detail]) => (
             <Card key={n}>
               <CardContent className="flex gap-3 p-4">
-                <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded bg-cyan-400/10 font-mono text-sm text-aqua">{n}</div>
+                <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded bg-aqua/10 font-mono text-sm text-aqua">{n}</div>
                 <div>
                   <div className="font-semibold text-white">{title}</div>
                   <div className="mt-1 text-sm leading-5 text-slate-400">{detail}</div>
@@ -500,12 +499,13 @@ function AstExplorer({ evaluation }: { evaluation: EvaluationOutput | null }) {
 function MemorySection({ evaluation }: { evaluation: EvaluationOutput | null }) {
   const [filter, setFilter] = useState('all');
   const filtered = memoryObjects.filter((item) => filter === 'all' || item.phase === filter);
+  const envObjects = memoryObjects.filter((item) => item.name.includes('Env'));
   return (
     <Section
       id="memory"
       eyebrow="memory representation"
       title="What Lives Across Requests and What Gets Rebuilt"
-      description="The hot path is split sharply: Kubernetes spends compile-time memory on reusable programs and request-time memory on activation, object conversion, result details, and cost accounting."
+      description="The hot path is split sharply: Kubernetes spends a lot of retained memory on reusable environments and programs, then keeps request-time allocation focused on activation, object conversion, result details, and cost accounting."
       icon={MemoryStick}
     >
       <div className="grid gap-4 xl:grid-cols-[1.1fr_0.9fr]">
@@ -515,9 +515,10 @@ function MemorySection({ evaluation }: { evaluation: EvaluationOutput | null }) 
               <Boxes className="h-4 w-4 text-aqua" />
               Object lifetime explorer
             </CardTitle>
-            <CardDescription>Filter by lifetime to see allocation pressure boundaries.</CardDescription>
+            <CardDescription>EnvSet and cel.Env are intentionally large, persistent memory anchors.</CardDescription>
           </CardHeader>
           <CardContent className="space-y-3">
+            <EnvPressurePanel envObjects={envObjects} />
             <Tabs
               value={filter}
               onValueChange={setFilter}
@@ -531,7 +532,13 @@ function MemorySection({ evaluation }: { evaluation: EvaluationOutput | null }) 
             />
             <div className="grid gap-3 md:grid-cols-2">
               {filtered.map((item) => (
-                <div key={item.name} className="rounded-lg border border-line bg-panel2 p-3">
+                <div
+                  key={item.name}
+                  className={cn(
+                    'rounded-lg border border-line bg-panel2 p-3',
+                    item.name.includes('Env') && 'border-aqua/60 bg-aqua/10 shadow-glow',
+                  )}
+                >
                   <div className="flex items-center justify-between gap-2">
                     <div className="font-semibold text-white">{item.name}</div>
                     <Badge tone={phaseTone(item.phase)}>{item.phase}</Badge>
@@ -553,6 +560,47 @@ function MemorySection({ evaluation }: { evaluation: EvaluationOutput | null }) 
         </div>
       </div>
     </Section>
+  );
+}
+
+function EnvPressurePanel({
+  envObjects,
+}: {
+  envObjects: Array<{ name: string; allocation: string; reuse: string; stores: string }>;
+}) {
+  return (
+    <div className="rounded-lg border border-aqua/50 bg-gradient-to-br from-aqua/15 to-amber/10 p-4 shadow-glow">
+      <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+        <div className="max-w-2xl">
+          <div className="flex flex-wrap items-center gap-2">
+            <Badge tone="cyan">heavy retained memory</Badge>
+            <Badge tone="amber">compile-time only</Badge>
+          </div>
+          <h3 className="mt-3 text-xl font-semibold text-white">EnvSet and cel.Env are the big memory anchor.</h3>
+          <p className="mt-2 text-sm leading-6 text-stone-300">
+            The environment is not just a variable map. It carries declarations, Kubernetes and CEL libraries, type adapters, parser/checker
+            configuration, program options, and the shared dispatcher backing overload lookup. That is why Kubernetes memoizes it aggressively
+            and keeps environment construction away from request evaluation.
+          </p>
+        </div>
+        <div className="grid min-w-[220px] gap-2 text-sm">
+          {envObjects.map((item) => (
+            <div key={item.name} className="rounded border border-aqua/30 bg-ink/70 p-3">
+              <div className="font-semibold text-orange-100">{item.name}</div>
+              <div className="mt-1 text-xs leading-5 text-stone-400">{item.reuse}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+      <div className="mt-4 grid gap-3 md:grid-cols-2">
+        {envPressureFacts.map((fact) => (
+          <div key={fact.label} className="rounded border border-line bg-panel/80 p-3">
+            <div className="font-mono text-xs uppercase text-amber">{fact.label}</div>
+            <div className="mt-1 text-sm leading-5 text-stone-300">{fact.value}</div>
+          </div>
+        ))}
+      </div>
+    </div>
   );
 }
 
@@ -649,7 +697,7 @@ function RuntimeSection({ evaluation }: { evaluation: EvaluationOutput | null })
                   onClick={() => setSelected(key)}
                   className={cn(
                     'flex w-full items-center gap-3 rounded-md border border-line bg-panel2 p-3 text-left transition-colors hover:bg-slate-800',
-                    selected === key && 'border-aqua bg-cyan-400/10',
+                    selected === key && 'border-aqua bg-aqua/10',
                   )}
                 >
                   <LayerIcon className="h-5 w-5 text-aqua" />
@@ -792,7 +840,7 @@ function ActivationSection() {
                   transition={{ delay: index * 0.06 }}
                   className="flex items-start gap-3"
                 >
-                  <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded bg-cyan-400/10 font-mono text-xs text-aqua">
+                  <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded bg-aqua/10 font-mono text-xs text-aqua">
                     {index + 1}
                   </div>
                   <div className="rounded border border-line bg-panel2 p-3">
@@ -943,7 +991,7 @@ function SimulatorSection({
                       exit={{ opacity: 0 }}
                       className={cn(
                         'w-full rounded-md border p-3 text-left transition-colors',
-                        index === activeStep ? 'border-aqua bg-cyan-400/10' : 'border-line bg-panel2 hover:bg-slate-800',
+                        index === activeStep ? 'border-aqua bg-aqua/10' : 'border-line bg-panel2 hover:bg-stone-800',
                       )}
                     >
                       <TraceRow step={step} />
@@ -1090,13 +1138,13 @@ function MermaidChart({ chart }: { chart: string }) {
       theme: 'dark',
       securityLevel: 'loose',
       themeVariables: {
-        background: '#0d121a',
-        primaryColor: '#121925',
-        primaryBorderColor: '#273243',
-        primaryTextColor: '#e2e8f0',
-        lineColor: '#22d3ee',
-        secondaryColor: '#0f172a',
-        tertiaryColor: '#111827',
+        background: '#191713',
+        primaryColor: '#211f1a',
+        primaryBorderColor: '#3c352c',
+        primaryTextColor: '#ece4d8',
+        lineColor: '#d97757',
+        secondaryColor: '#2a241c',
+        tertiaryColor: '#171512',
       },
     });
     mermaid.render(id, chart).then(({ svg }) => {

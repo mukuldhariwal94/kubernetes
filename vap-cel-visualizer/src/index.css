@@ -4,7 +4,7 @@
 
 :root {
   color-scheme: dark;
-  background: #080b10;
+  background: #11100e;
   font-family: Inter, ui-sans-serif, system-ui, sans-serif;
 }
 
@@ -13,10 +13,11 @@ body {
   min-width: 320px;
   min-height: 100vh;
   background:
-    linear-gradient(180deg, rgba(34, 211, 238, 0.08), transparent 22rem),
-    radial-gradient(circle at 10% 20%, rgba(74, 222, 128, 0.08), transparent 25rem),
-    #080b10;
-  color: #e2e8f0;
+    linear-gradient(180deg, rgba(217, 119, 87, 0.10), transparent 22rem),
+    radial-gradient(circle at 12% 14%, rgba(208, 154, 79, 0.08), transparent 24rem),
+    radial-gradient(circle at 86% 8%, rgba(138, 163, 111, 0.07), transparent 24rem),
+    #11100e;
+  color: #ece4d8;
 }
 
 * {
@@ -28,7 +29,7 @@ html {
 }
 
 ::selection {
-  background: rgba(34, 211, 238, 0.35);
+  background: rgba(217, 119, 87, 0.35);
 }
 
 ::-webkit-scrollbar {
@@ -37,12 +38,12 @@ html {
 }
 
 ::-webkit-scrollbar-thumb {
-  background: #273243;
+  background: #3c352c;
   border-radius: 999px;
 }
 
 ::-webkit-scrollbar-track {
-  background: #0d121a;
+  background: #191713;
 }
 
 .react-flow__node {
@@ -50,18 +51,18 @@ html {
 }
 
 .react-flow__handle {
-  background: #22d3ee;
+  background: #d97757;
 }
 
 .react-flow__controls {
-  background: #121925;
-  border: 1px solid #273243;
+  background: #211f1a;
+  border: 1px solid #3c352c;
 }
 
 .react-flow__controls button {
-  background: #121925;
-  border-bottom: 1px solid #273243;
-  color: #e2e8f0;
+  background: #211f1a;
+  border-bottom: 1px solid #3c352c;
+  color: #ece4d8;
 }
 
 .mermaid-box svg {
@@ -72,5 +73,5 @@ html {
 .monaco-editor,
 .monaco-editor-background,
 .monaco-editor .margin {
-  background-color: #0d121a !important;
+  background-color: #191713 !important;
 }
