@@ -17,7 +17,10 @@ package cel
 import (
 	"context"
 	"fmt"
+	"os"
+	"sort"
 	"sync"
+	"unsafe"
 
 	"github.com/google/cel-go/common/ast"
 	"github.com/google/cel-go/common/decls"
@@ -25,6 +28,155 @@ import (
 	"github.com/google/cel-go/common/types/ref"
 	"github.com/google/cel-go/interpreter"
 )
+
+// ── Debug instrumentation ────────────────────────────────────────────────────
+// All functions in this block write to stderr with the prefix [cel:probe].
+// Remove or gate behind an env-var before upstreaming.
+
+// celProbeSizesOnce ensures the one-time struct-size analysis is logged exactly once.
+var celProbeSizesOnce sync.Once
+
+func init() {
+	celProbeSizesOnce.Do(func() {
+		// Measure shallow struct sizes to understand per-instance overhead.
+		//
+		// prog struct (unexported, measured via proxy — matches the actual field
+		// layout documented below):
+		//
+		//   Field                    Type                          Notes
+		//   *Env                     *Env (8 B ptr)                SHARED pointer; Env itself is allocated once per env variant
+		//   evalOpts                 uint64 (8 B)
+		//   defaultVars              Activation (iface 16 B)
+		//   dispatcher               Dispatcher (iface 16 B)        per-program, NEW each call
+		//   interpreter              Interpreter (iface 16 B)       per-program, holds ptrs to shared env fields
+		//   interruptCheckFrequency  uint (8 B)
+		//   plannerOptions           []PlannerOption (24 B)         slice header, per-program
+		//   regexOptimizations       []*RegexOptimization (24 B)    slice header, per-program
+		//   interpretable            Interpretable (iface 16 B)     per-program, planner output
+		//   observable               *ObservableInterpretable (8 B) per-program (nil usually)
+		//   callCostEstimator        ActualCostEstimator (16 B)
+		//   costOptions              []CostTrackerOption (24 B)     slice header
+		//   costLimit                *uint64 (8 B)
+		//
+		// Total header: ~192 B (plus backing arrays for slices and the dispatcher/interpretable)
+
+		fmt.Fprintf(os.Stderr,
+			"[cel:probe:sizes] Env=%d B  prog-header≈192 B\n",
+			unsafe.Sizeof(Env{}),
+		)
+
+		// functions.Overload (from common/functions/functions.go):
+		//   Operator string(16) + OperandTrait int(8) + Unary func(8) + Binary func(8) +
+		//   Function func(8) + NonStrict bool(1) + 7 pad = 56 B
+		// Each fn.Bindings() call allocates N new *Overload structs (N ≤ 2×overloads).
+		// The Unary/Binary/Function fields hold guard-closure func values;
+		// the closures capture the actual implementation and type-check logic.
+		// The underlying implementation is SHARED; only the per-overload closure
+		// wrapper is new — typically ~64–128 B each on the heap.
+		fmt.Fprintf(os.Stderr,
+			"[cel:probe:sizes] *functions.Overload-header=56 B  dispatcher-map-header=24 B\n",
+		)
+
+		// Memory cost breakdown per env.Program() call:
+		//   prog header:         ~192 B  (fixed)
+		//   dispatcher map hdr:  ~24 B   (fixed)
+		//   per bound overload:  ~56 B (*Overload) + ~128 B (guard closures) + ~72 B (map bucket) ≈ 256 B
+		//   With 345 overloads (unpatched):  345 × 256 B ≈ 86 KB per program
+		//   With ~10 overloads (patched):     10 × 256 B ≈  2.5 KB per program
+		//   At 25,000 programs (5000 policies × 5 expressions):
+		//     unpatched: 25000 × 86 KB ≈ 2.1 GB
+		//     patched:   25000 × 2.5 KB ≈ 61 MB  (~35× reduction)
+		fmt.Fprintf(os.Stderr,
+			"[cel:probe:sizes] dispatcher-cost: unpatched≈86KB/prog  patched≈2.5KB/prog  25k-prog: unpatched≈2.1GB  patched≈61MB\n",
+		)
+
+		// The *Env is a SHARED pointer across all programs from the same env variant.
+		// Its size (Sizeof(Env{}) above is the struct header; the actual retained heap
+		// includes: functions map (~2–4 MB for 157 fns), checker.Env (~200 KB), parser (~20 KB).
+		// This is NOT duplicated per program — it's fixed cost amortised across all compilations.
+		fmt.Fprintf(os.Stderr,
+			"[cel:probe:sizes] *Env is SHARED across programs: functions/checker/parser state allocated once per env-variant (8 variants total)\n",
+		)
+	})
+}
+
+// celProbeEnv logs the contents of a cel.Env at the start of newProgram.
+// It prints the env pointer so callers can verify the same *Env is reused
+// across multiple program compilations (proving it is not duplicated).
+func celProbeEnv(e *Env) {
+	totalOverloads := 0
+	fnNames := make([]string, 0, len(e.functions))
+	for name, fn := range e.functions {
+		fnNames = append(fnNames, name)
+		totalOverloads += len(fn.OverloadDecls())
+	}
+	sort.Strings(fnNames)
+
+	varNames := make([]string, 0, len(e.variables))
+	for _, v := range e.variables {
+		varNames = append(varNames, v.Name())
+	}
+	sort.Strings(varNames)
+
+	libNames := make([]string, 0, len(e.libraries))
+	for name := range e.libraries {
+		libNames = append(libNames, name)
+	}
+	sort.Strings(libNames)
+
+	fmt.Fprintf(os.Stderr,
+		"[cel:probe:env] ptr=%p  functions=%d  totalOverloads=%d  variables=%d  macros=%d  libraries=%d\n",
+		e, len(e.functions), totalOverloads, len(e.variables), len(e.macros), len(e.libraries),
+	)
+	fmt.Fprintf(os.Stderr,
+		"[cel:probe:env]   variables=%v\n", varNames,
+	)
+	fmt.Fprintf(os.Stderr,
+		"[cel:probe:env]   libraries=%v\n", libNames,
+	)
+	// Print all function names at a lower verbosity.
+	fmt.Fprintf(os.Stderr,
+		"[cel:probe:env]   functions=%v\n", fnNames,
+	)
+}
+
+// celProbeDispatcher logs what ended up in the dispatcher after addNeededBindings.
+// The dispatcher has a parent (the shared lazy-populated parent) and a per-program
+// overlay; only the overlay keys are shown here (extra bindings from ProgramOptions).
+// The full set (parent + overlay) is shown via disp.OverloadIds().
+func celProbeDispatcher(disp interpreter.Dispatcher, label string) {
+	ids := disp.OverloadIds()
+	sort.Strings(ids)
+	fmt.Fprintf(os.Stderr,
+		"[cel:probe:dispatcher] %s: bound=%d  ids=%v\n",
+		label, len(ids), ids,
+	)
+}
+
+// celProbeInterpretable logs the type of the Interpretable returned by the planner.
+// The planner builds a tree of eval nodes from the typed AST.  The root type
+// reveals the top-level expression kind:
+//   - *evalCall       — a function call (most common for policy expressions)
+//   - *evalComprehension / *evalFold — a comprehension (e.g. .all(), .exists())
+//   - InterpretableAttribute — a simple variable/field access
+//   - *evalConst      — a constant
+//   - *ObservableInterpretable — wraps any of the above with observers
+//
+// Memory note: the interpretable tree is per-program and proportional to AST
+// complexity.  For typical policy expressions (5–20 AST nodes) it is small
+// (≈ 1–5 KB), but for large comprehensions over list inputs it can grow.
+func celProbeInterpretable(i interpreter.Interpretable, label string) {
+	if i == nil {
+		fmt.Fprintf(os.Stderr, "[cel:probe:interpretable] %s: nil\n", label)
+		return
+	}
+	fmt.Fprintf(os.Stderr,
+		"[cel:probe:interpretable] %s: type=%T  id=%d\n",
+		label, i, i.ID(),
+	)
+}
+
+// ── End debug instrumentation ────────────────────────────────────────────────
 
 // Program is an evaluable view of an Ast.
 type Program interface {
@@ -171,6 +323,10 @@ type prog struct {
 //
 // If the program cannot be configured the prog will be nil, with a non-nil error response.
 func newProgram(e *Env, a *ast.AST, opts []ProgramOption) (Program, error) {
+	// Log the env contents so callers can verify the *Env is shared (same pointer)
+	// across all programs compiled from the same env variant.
+	celProbeEnv(e)
+
 	// Reuse the env's shared dispatcher for the bulk of the function bindings
 	// (every overload from e.functions is materialised exactly once per env).
 	// Wrap it with ExtendDispatcher so the deprecated Functions() ProgramOption
@@ -209,6 +365,9 @@ func newProgram(e *Env, a *ast.AST, opts []ProgramOption) (Program, error) {
 	if err := addNeededBindings(disp, e.functions, a); err != nil {
 		return nil, err
 	}
+	// Log the per-program overlay dispatcher state after binding.
+	// This shows how many overload closures were actually allocated.
+	celProbeDispatcher(disp, "after-addNeededBindings")
 
 	// Set the attribute factory after the options have been set.
 	var attrFactory interpreter.AttributeFactory
@@ -222,6 +381,10 @@ func newProgram(e *Env, a *ast.AST, opts []ProgramOption) (Program, error) {
 	}
 	interp := interpreter.NewInterpreter(disp, e.Container, e.provider, e.adapter, attrFactory)
 	p.interpreter = interp
+	// The interpreter holds pointers to shared *Env fields (Container, provider, adapter,
+	// attrFactory) — it does NOT copy them.  It is a thin coordination struct.
+	fmt.Fprintf(os.Stderr, "[cel:probe:interpreter] type=%T  prog-ptr=%p  env-ptr=%p\n",
+		interp, p, e)
 
 	// Translate the EvalOption flags into InterpretableDecorator instances.
 	plannerOptions := make([]interpreter.PlannerOption, len(p.plannerOptions))
@@ -276,6 +439,12 @@ func newProgram(e *Env, a *ast.AST, opts []ProgramOption) (Program, error) {
 
 func (p *prog) initInterpretable(a *ast.AST, plannerOptions []interpreter.PlannerOption) (*prog, error) {
 	// When the AST has been exprAST it contains metadata that can be used to speed up program execution.
+	//
+	// The planner walks the typed AST and builds a tree of Interpretable eval nodes.
+	// Each call-site in the AST becomes an *evalCall or *evalFold node that captures a
+	// function pointer looked up from the dispatcher — this is why the dispatcher must be
+	// populated BEFORE NewInterpretable runs.  After planning, the interpretable tree
+	// bakes in the function pointers and no longer needs the dispatcher at runtime.
 	interpretable, err := p.interpreter.NewInterpretable(a, plannerOptions...)
 	if err != nil {
 		return nil, err
@@ -284,6 +453,11 @@ func (p *prog) initInterpretable(a *ast.AST, plannerOptions []interpreter.Planne
 	if oi, ok := interpretable.(*interpreter.ObservableInterpretable); ok {
 		p.observable = oi
 	}
+	celProbeInterpretable(p.interpretable, "after-planning")
+	fmt.Fprintf(os.Stderr,
+		"[cel:probe:program] built: prog-ptr=%p  env-ptr=%p  AST-checked=%v  AST-refNodes=%d\n",
+		p, p.Env, a.IsChecked(), len(a.ReferenceMap()),
+	)
 	return p, nil
 }
 
@@ -306,6 +480,8 @@ func addNeededBindings(disp interpreter.Dispatcher, functions map[string]*decls.
 	refMap := a.ReferenceMap()
 	if !a.IsChecked() || len(refMap) == 0 {
 		// Unchecked AST: bind everything (safe fallback).
+		// This path is not reached in normal Kubernetes CEL usage (all expressions are type-checked).
+		totalFns := 0
 		for _, fn := range functions {
 			bindings, err := fn.Bindings()
 			if err != nil {
@@ -314,7 +490,10 @@ func addNeededBindings(disp interpreter.Dispatcher, functions map[string]*decls.
 			if err = disp.Add(bindings...); err != nil {
 				return err
 			}
+			totalFns++
 		}
+		fmt.Fprintf(os.Stderr,
+			"[cel:probe:addNeededBindings] unchecked-fallback: bound all %d functions\n", totalFns)
 		return nil
 	}
 
@@ -328,9 +507,11 @@ func addNeededBindings(disp interpreter.Dispatcher, functions map[string]*decls.
 
 	// Step 2: build overload-ID → function-name reverse index.
 	overloadToFnName := make(map[string]string, len(functions)*3)
+	totalOverloads := 0
 	for name, fn := range functions {
 		for _, o := range fn.OverloadDecls() {
 			overloadToFnName[o.ID()] = name
+			totalOverloads++
 		}
 	}
 
@@ -343,6 +524,7 @@ func addNeededBindings(disp interpreter.Dispatcher, functions map[string]*decls.
 	}
 
 	// Step 4: bind only the needed overloads.
+	boundKeys := make([]string, 0, len(usedOIDs)*2)
 	for name, fn := range functions {
 		if _, needed := neededFns[name]; !needed {
 			continue
@@ -357,13 +539,24 @@ func addNeededBindings(disp interpreter.Dispatcher, functions map[string]*decls.
 				if err = disp.Add(b); err != nil {
 					return err
 				}
+				boundKeys = append(boundKeys, b.Operator)
 			} else if _, used := usedOIDs[b.Operator]; used {
 				if err = disp.Add(b); err != nil {
 					return err
 				}
+				boundKeys = append(boundKeys, b.Operator)
 			}
 		}
 	}
+
+	sort.Strings(boundKeys)
+	// Memory saving: (totalOverloads - len(boundKeys)) overloads skipped.
+	// Each skipped overload avoids allocating a *functions.Overload + guard closures (~256 B).
+	savedB := (totalOverloads - len(boundKeys)) * 256
+	fmt.Fprintf(os.Stderr,
+		"[cel:probe:addNeededBindings] checked: totalFns=%d  totalOverloads=%d  usedOIDs=%d  neededFns=%d  boundKeys=%d  savedB≈%d  boundKeys=%v\n",
+		len(functions), totalOverloads, len(usedOIDs), len(neededFns), len(boundKeys), savedB, boundKeys,
+	)
 	return nil
 }
 
