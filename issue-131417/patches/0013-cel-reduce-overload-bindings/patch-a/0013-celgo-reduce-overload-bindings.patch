@@ -1,0 +1,99 @@
+diff --git a/vendor/github.com/google/cel-go/cel/program.go b/vendor/github.com/google/cel-go/cel/program.go
+index 24f41a4a77e..5b2e1701ebf 100644
+--- a/vendor/github.com/google/cel-go/cel/program.go
++++ b/vendor/github.com/google/cel-go/cel/program.go
+@@ -20,6 +20,7 @@ import (
+ 	"sync"
+ 
+ 	"github.com/google/cel-go/common/ast"
++	"github.com/google/cel-go/common/decls"
+ 	"github.com/google/cel-go/common/types"
+ 	"github.com/google/cel-go/common/types/ref"
+ 	"github.com/google/cel-go/interpreter"
+@@ -191,15 +192,38 @@ func newProgram(e *Env, a *ast.AST, opts []ProgramOption) (Program, error) {
+ 		}
+ 	}
+ 
+-	// Add the function bindings created via Function() options.
+-	for _, fn := range e.functions {
+-		bindings, err := fn.Bindings()
+-		if err != nil {
+-			return nil, err
++	refMap := a.ReferenceMap()
++	if a.IsChecked() && len(refMap) != 0 {
++		// Checked AST: build the set of overload IDs actually used by this expression
++		// and only add bindings for functions that have at least one matching overload.
++		usedOIDs := make(map[string]struct{}, len(refMap))
++		for _, ref := range refMap {
++			for _, oID := range ref.OverloadIDs {
++				usedOIDs[oID] = struct{}{}
++			}
+ 		}
+-		err = disp.Add(bindings...)
+-		if err != nil {
+-			return nil, err
++		for _, fn := range e.functions {
++			if !fnOverlapsOIDs(fn, usedOIDs) {
++				continue
++			}
++			bindings, err := fn.Bindings()
++			if err != nil {
++				return nil, err
++			}
++			if err = disp.Add(bindings...); err != nil {
++				return nil, err
++			}
++		}
++	} else {
++		// Unchecked AST or empty ref-map: add all function bindings as before.
++		for _, fn := range e.functions {
++			bindings, err := fn.Bindings()
++			if err != nil {
++				return nil, err
++			}
++			if err = disp.Add(bindings...); err != nil {
++				return nil, err
++			}
+ 		}
+ 	}
+ 
+@@ -486,6 +510,18 @@ func (p *evalActivationPool) Put(value any) {
+ 	p.Pool.Put(a)
+ }
+ 
++// fnOverlapsOIDs reports whether fn declares at least one overload whose ID
++// appears in usedOIDs. It iterates usedOIDs (typically 5–20 entries) and calls
++// fn.HasOverloadID for each, avoiding the slice allocation of OverloadDecls().
++func fnOverlapsOIDs(fn *decls.FunctionDecl, usedOIDs map[string]struct{}) bool {
++	for oID := range usedOIDs {
++		if fn.HasOverloadID(oID) {
++			return true
++		}
++	}
++	return false
++}
++
+ var (
+ 	// activationPool is an internally managed pool of Activation values that wrap map[string]any inputs
+ 	activationPool = newEvalActivationPool()
+diff --git a/vendor/github.com/google/cel-go/common/decls/decls.go b/vendor/github.com/google/cel-go/common/decls/decls.go
+index a4a51c3f282..2acc3762b2e 100644
+--- a/vendor/github.com/google/cel-go/common/decls/decls.go
++++ b/vendor/github.com/google/cel-go/common/decls/decls.go
+@@ -290,6 +290,16 @@ func (f *FunctionDecl) AddOverload(overload *OverloadDecl) error {
+ 	return nil
+ }
+ 
++// HasOverloadID reports whether the function declares an overload with the given ID.
++// Uses the internal map directly — O(1), no slice allocation.
++func (f *FunctionDecl) HasOverloadID(id string) bool {
++	if f == nil {
++		return false
++	}
++	_, ok := f.overloads[id]
++	return ok
++}
++
+ // OverloadDecls returns the overload declarations in the order in which they were declared.
+ func (f *FunctionDecl) OverloadDecls() []*OverloadDecl {
+ 	var emptySet []*OverloadDecl

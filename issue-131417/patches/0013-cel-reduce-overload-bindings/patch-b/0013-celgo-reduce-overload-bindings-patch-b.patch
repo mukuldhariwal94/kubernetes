@@ -1,0 +1,104 @@
+diff --git a/vendor/github.com/google/cel-go/cel/env.go b/vendor/github.com/google/cel-go/cel/env.go
+index bb3014464e5..acb2e691852 100644
+--- a/vendor/github.com/google/cel-go/cel/env.go
++++ b/vendor/github.com/google/cel-go/cel/env.go
+@@ -155,6 +155,13 @@ type Env struct {
+ 
+ 	// Program options tied to the environment
+ 	progOpts []ProgramOption
++
++	// oidToFn is a reverse index: overload ID → the FunctionDecl that declares it.
++	// Built once per Env via sync.Once the first time newProgram is called.
++	// Every Env extension starts with a zero-value sync.Once so the index is
++	// rebuilt lazily if the function set changes.
++	oidToFnOnce sync.Once
++	oidToFn     map[string]*decls.FunctionDecl
+ }
+ 
+ // ToConfig produces a YAML-serializable env.Config object from the given environment.
+@@ -832,6 +839,22 @@ func (e *Env) initChecker() (*checker.Env, error) {
+ 	return e.getCheckerOrError()
+ }
+ 
++// overloadIndex returns a map from overload ID to the FunctionDecl that declares it.
++// The map is built once per Env (O(total overloads)) and reused by every newProgram
++// call, so each program compilation only pays O(|usedOIDs|) for binding selection.
++func (e *Env) overloadIndex() map[string]*decls.FunctionDecl {
++	e.oidToFnOnce.Do(func() {
++		idx := make(map[string]*decls.FunctionDecl, len(e.functions)*2)
++		for _, fn := range e.functions {
++			for _, o := range fn.OverloadDecls() {
++				idx[o.ID()] = fn
++			}
++		}
++		e.oidToFn = idx
++	})
++	return e.oidToFn
++}
++
+ // setCheckerOrError sets the checker.Env or error state in a concurrency-safe manner
+ func (e *Env) setCheckerOrError(chk *checker.Env, chkErr error) {
+ 	e.chkMutex.Lock()
+diff --git a/vendor/github.com/google/cel-go/cel/program.go b/vendor/github.com/google/cel-go/cel/program.go
+index 24f41a4a77e..b573c595d01 100644
+--- a/vendor/github.com/google/cel-go/cel/program.go
++++ b/vendor/github.com/google/cel-go/cel/program.go
+@@ -20,6 +20,7 @@ import (
+ 	"sync"
+ 
+ 	"github.com/google/cel-go/common/ast"
++	"github.com/google/cel-go/common/decls"
+ 	"github.com/google/cel-go/common/types"
+ 	"github.com/google/cel-go/common/types/ref"
+ 	"github.com/google/cel-go/interpreter"
+@@ -191,15 +192,42 @@ func newProgram(e *Env, a *ast.AST, opts []ProgramOption) (Program, error) {
+ 		}
+ 	}
+ 
+-	// Add the function bindings created via Function() options.
+-	for _, fn := range e.functions {
+-		bindings, err := fn.Bindings()
+-		if err != nil {
+-			return nil, err
++	refMap := a.ReferenceMap()
++	if a.IsChecked() && len(refMap) != 0 {
++		// Checked AST: use the Env-level OID→FunctionDecl index (built once, O(1) lookup)
++		// to find exactly which functions are needed, then add only their bindings.
++		// seen deduplicates functions reached by multiple overload IDs in the same expression.
++		oidIndex := e.overloadIndex()
++		seen := make(map[*decls.FunctionDecl]struct{}, len(refMap))
++		for _, ref := range refMap {
++			for _, oID := range ref.OverloadIDs {
++				fn := oidIndex[oID]
++				if fn == nil {
++					continue
++				}
++				if _, ok := seen[fn]; ok {
++					continue
++				}
++				seen[fn] = struct{}{}
++				bindings, err := fn.Bindings()
++				if err != nil {
++					return nil, err
++				}
++				if err = disp.Add(bindings...); err != nil {
++					return nil, err
++				}
++			}
+ 		}
+-		err = disp.Add(bindings...)
+-		if err != nil {
+-			return nil, err
++	} else {
++		// Unchecked AST or empty ref-map: add all function bindings as before.
++		for _, fn := range e.functions {
++			bindings, err := fn.Bindings()
++			if err != nil {
++				return nil, err
++			}
++			if err = disp.Add(bindings...); err != nil {
++				return nil, err
++			}
+ 		}
+ 	}
+ 

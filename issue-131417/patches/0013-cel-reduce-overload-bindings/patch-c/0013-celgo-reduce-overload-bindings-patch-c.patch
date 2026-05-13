@@ -1,0 +1,89 @@
+diff --git a/vendor/github.com/google/cel-go/cel/program.go b/vendor/github.com/google/cel-go/cel/program.go
+index 24f41a4a77e..c162f4b8387 100644
+--- a/vendor/github.com/google/cel-go/cel/program.go
++++ b/vendor/github.com/google/cel-go/cel/program.go
+@@ -191,15 +191,45 @@ func newProgram(e *Env, a *ast.AST, opts []ProgramOption) (Program, error) {
+ 		}
+ 	}
+ 
+-	// Add the function bindings created via Function() options.
+-	for _, fn := range e.functions {
+-		bindings, err := fn.Bindings()
+-		if err != nil {
+-			return nil, err
++	refMap := a.ReferenceMap()
++	if a.IsChecked() && len(refMap) != 0 {
++		// Checked AST: the checker stored fn.Name() in ReferenceInfo.Name for every
++		// function call node. Walk refMap, look up each function by name directly
++		// in e.functions (O(1)), and add bindings only for the functions used.
++		// seen deduplicates functions that appear at multiple call sites.
++		seen := make(map[string]struct{}, len(refMap))
++		for _, ref := range refMap {
++			fnName := ref.Name
++			if fnName == "" || len(ref.OverloadIDs) == 0 {
++				// Ident or constant reference — not a function call node.
++				continue
++			}
++			if _, ok := seen[fnName]; ok {
++				continue
++			}
++			seen[fnName] = struct{}{}
++			fn := e.functions[fnName]
++			if fn == nil {
++				continue
++			}
++			bindings, err := fn.Bindings()
++			if err != nil {
++				return nil, err
++			}
++			if err = disp.Add(bindings...); err != nil {
++				return nil, err
++			}
+ 		}
+-		err = disp.Add(bindings...)
+-		if err != nil {
+-			return nil, err
++	} else {
++		// Unchecked AST or empty ref-map: add all function bindings as before.
++		for _, fn := range e.functions {
++			bindings, err := fn.Bindings()
++			if err != nil {
++				return nil, err
++			}
++			if err = disp.Add(bindings...); err != nil {
++				return nil, err
++			}
+ 		}
+ 	}
+ 
+diff --git a/vendor/github.com/google/cel-go/checker/checker.go b/vendor/github.com/google/cel-go/checker/checker.go
+index 0057c16ccb5..e22adafbf15 100644
+--- a/vendor/github.com/google/cel-go/checker/checker.go
++++ b/vendor/github.com/google/cel-go/checker/checker.go
+@@ -167,7 +167,9 @@ func (c *checker) checkOptSelect(e ast.Expr) {
+ 	// Perform type-checking using the field selection logic.
+ 	resultType := c.checkSelectField(e, operand, fieldName, true)
+ 	c.setType(e, substitute(c.mappings, resultType, false))
+-	c.setReference(e, ast.NewFunctionReference("select_optional_field"))
++	ref := ast.NewFunctionReference("select_optional_field")
++	ref.Name = "select_optional_field"
++	c.setReference(e, ref)
+ }
+ 
+ func (c *checker) checkSelectField(e, operand ast.Expr, field string, optional bool) *types.Type {
+@@ -324,6 +326,7 @@ func (c *checker) resolveOverload(
+ 		// variadic AST representations.
+ 		if fn.Name() == operators.LogicalAnd || fn.Name() == operators.LogicalOr {
+ 			checkedRef = ast.NewFunctionReference(overload.ID())
++			checkedRef.Name = fn.Name()
+ 			for i, argType := range argTypes {
+ 				if !c.isAssignable(argType, types.BoolType) {
+ 					c.errors.typeMismatch(
+@@ -355,6 +358,7 @@ func (c *checker) resolveOverload(
+ 		if c.isAssignableList(argTypes, candidateArgTypes) {
+ 			if checkedRef == nil {
+ 				checkedRef = ast.NewFunctionReference(overload.ID())
++				checkedRef.Name = fn.Name()
+ 			} else {
+ 				checkedRef.AddOverload(overload.ID())
+ 			}

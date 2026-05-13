@@ -1,160 +1,210 @@
-# 0013 — cel-go: reduce function overload bindings in `newProgram`
+# 0013 — cel-go: reduce dispatcher overload bindings per CEL program
 
-**Status:** prototype, applied to local working tree (vendored cel-go v0.26.0).  
-**Side:** cel-go vendor (`vendor/github.com/google/cel-go/cel/program.go`).  
-**Headline impact:** **~98 % reduction in `*functions.Overload` closure allocations per
-`env.Program()` call** for type-checked expressions — from 345 closures down to 5–15
-depending on expression complexity.
+## Problem
 
-## What this patch addresses
+Every call to `cel.Env.Program()` (via `newProgram`) unconditionally iterates
+all ~157 registered `FunctionDecl` entries in the environment and calls
+`fn.Bindings()` on each one, adding all ~345 overload entries to the
+per-program `Dispatcher`.
 
-Every call to `env.Program(ast, ...)` in `newProgram()` iterates over **all** registered
-functions and unconditionally calls `fn.Bindings()` for each:
+For a typical Kubernetes ValidatingAdmissionPolicy expression that uses only
+4–15 distinct functions, **~98 % of the dispatcher entries are allocated and
+immediately wasted** — they occupy heap for the lifetime of every compiled
+`cel.Program` but are never looked up at evaluation time.
+
+At scale (hundreds of policies × multiple validations + match conditions) the
+wasted allocation compounds significantly on the apiserver heap.
+
+### Root cause
 
 ```go
-// before (vendor/github.com/google/cel-go/cel/program.go:192-200)
-for _, fn := range e.functions {
-    bindings, err := fn.Bindings()
-    if err != nil {
-        return nil, err
-    }
-    err = disp.Add(bindings...)
-    if err != nil {
-        return nil, err
-    }
+// vendor/github.com/google/cel-go/cel/program.go  (upstream)
+for _, fn := range e.functions {   // iterates all ~157 functions
+    bindings, _ := fn.Bindings()   // allocates *functions.Overload structs
+    disp.Add(bindings...)          // adds ~2–3 entries per function
 }
 ```
 
-`fn.Bindings()` allocates a new `*functions.Overload` struct per declared overload,
-wrapping Go closures around each implementation. The dispatcher then holds references to
-all of them for the lifetime of the `cel.Program`.
+The `Dispatcher` is a `map[string]*functions.Overload` — one entry per
+allocated binding. The type-checker already knows exactly which overload IDs
+are needed (stored in `ast.ReferenceMap()[id].OverloadIDs`) but this
+information was never used to filter the bindings.
 
-In a production Kubernetes admission webhook environment the base `cel.Env` contains
-**157 functions / 345 overloads** sourced from 17 libraries (stdlib, ext.Strings, ext.Lists,
-library.Authz, library.IP, library.CIDR, library.Quantity, library.Format, etc.). A
-typical policy expression references only 5–15 of those 345 overloads.
+---
 
-Observed from production logs (`logFunctionBindingAnalysis` diagnostic in `compile.go`):
+## Approaches
 
-```
-expression="has(object.metadata.labels) && object.metadata.labels['env1'].matches('^prod-[a-z]+')"
-envOverloads=345  usedOverloads=5  wastedOverloads=340   (98.5 % waste)
-
-expression="(!has(object.spec.replicas) || object.spec.replicas <= 3) && size(...) <= 11"
-envOverloads=345  usedOverloads=11  wastedOverloads=334  (96.8 % waste)
-```
-
-At steady state with 5 000 policies × 5 expressions, this is **~8.5 million** unnecessary
-`*functions.Overload` allocations per full policy refresh, each holding a Go closure.
-
-## The fix — `addNeededBindings`
-
-Replace the unconditional loop with `addNeededBindings`, which uses the AST's
-`ReferenceMap()` (populated by the type-checker) to find the exact set of overload IDs
-resolved for this expression, then calls `fn.Bindings()` only for the functions that have
-at least one referenced overload:
+Three independent implementations of the same fix are provided. All share the
+same two-path structure in `newProgram`:
 
 ```
-Step 1  collect usedOIDs from ast.ReferenceMap()         e.g. {"matches_string", "logical_and", ...}
-Step 2  build overloadID → functionName reverse index    e.g. {"matches_string" → "matches", ...}
-Step 3  derive neededFns from usedOIDs                   e.g. {"matches", "_&&_", ...}
-Step 4  for each fn in neededFns: call fn.Bindings()
-        — add singleton binding if b.Operator == fnName
-        — add overload binding  if b.Operator ∈ usedOIDs
+if a.IsChecked() && len(refMap) != 0 {
+    // OPTIMISED PATH — only add bindings for functions the AST actually uses
+} else {
+    // ORIGINAL PATH — unchecked AST, adds all bindings unchanged
+}
 ```
 
-For unchecked ASTs (parse-only mode) the function falls back to the original behaviour and
-binds all functions.
+### At a glance
 
-### Dispatch key mechanics
-
-The `interpreter.Dispatcher` uses two key styles, which step 4 handles explicitly:
-
-| Binding type | `b.Operator` value | Dispatcher key |
-|---|---|---|
-| Singleton (one impl handles all type combos) | function name, e.g. `"_&&_"` | function name |
-| Per-overload (separate impl per type pair) | overload ID, e.g. `"int_add_int"` | overload ID |
-
-The planner resolves calls by first trying the overload ID, then falling back to the
-function name. Both cases are correctly handled.
-
-## Files touched
-
-```
-M  vendor/github.com/google/cel-go/cel/program.go   (+87 lines — addNeededBindings function + call site)
-```
-
-## Memory impact
-
-| Metric | Before | After | Delta |
+| | **Patch A** | **Patch B** | **Patch C** |
 |---|---|---|---|
-| `*functions.Overload` allocs per `env.Program()` | 345 | 5–15 | **−330 to −340 (−96–98%)** |
-| `fn.Bindings()` calls per `env.Program()` | 157 | 3–10 | **−144 to −154 (−92–98%)** |
-| Closures held in dispatcher per `cel.Program` | 345 | 5–15 | **−330 to −340** |
+| Folder | [`patch-a/`](patch-a/) | [`patch-b/`](patch-b/) | [`patch-c/`](patch-c/) |
+| Files changed | `program.go`, `decls.go` | `program.go`, `env.go` | `program.go`, `checker.go` |
+| Per-program hot path | O(F × U) ≈ O(3 140) | O(R × O) ≈ O(20–90) | O(R) ≈ O(8–30) |
+| Env overhead | none | ~5.5 KB (index, once) | none |
+| `e.functions` loop | kept (skips non-matching) | eliminated | eliminated |
+| External API change | no | no | no |
+| Status | ready | ready | ready |
 
-At 5 000 policies × 5 expressions per refresh:
+---
 
-| | Before | After | Delta |
-|---|---|---|---|
-| Overload allocs / refresh | ~8 625 000 | ~187 500 | **−8 437 500 (−97.8 %)** |
+### Patch A — inline `usedOIDs` set in `newProgram`
 
-## Correctness analysis
+**Folder:** [`patch-a/`](patch-a/)
+**Files:** `cel/program.go`, `common/decls/decls.go`
 
-- `ast.ReferenceMap()` is produced by the type-checker (`env.Compile`) on the line
-  immediately before `env.Program()`. It is stable, complete, and already available with
-  no extra cost.
-- Every overload ID in `ReferenceMap` corresponds exactly to a key used by the
-  `interpreter.Planner` to look up the binding. Filtering to these IDs is therefore
-  semantically equivalent to binding all of them.
-- Singleton functions (e.g. logical operators `_&&_`, `_||_`) register a single binding
-  keyed by the **function name**, not an overload ID. Step 4 correctly detects and
-  includes these via the `b.Operator == name` check.
-- Unchecked ASTs fall back to full binding, preserving the existing behaviour for any
-  code path that calls `env.Program` on a parse-only AST.
-- The `decls` import added to `program.go` is already present in the same module; it
-  introduces no new dependency.
+Builds a `usedOIDs map[string]struct{}` from `refMap` inside `newProgram`,
+then iterates `e.functions`. For each function a new helper `fnOverlapsOIDs`
+calls `fn.HasOverloadID(oID)` — a direct O(1) lookup into the unexported
+`overloads` map — for every entry in `usedOIDs`. Functions with no overlap
+are skipped entirely.
 
-## Reproduction
-
-Use the `logFunctionBindingAnalysis` diagnostic already in `compile.go` to confirm the
-before/after overload counts. Before the patch:
+`HasOverloadID` is the only addition to `decls.go`; it avoids the
+`[]*OverloadDecl` slice allocation that `OverloadDecls()` would otherwise
+perform on every call.
 
 ```
-envOverloads=345  usedOverloads=5  wastedOverloads=340
+newProgram (checked path):
+  1. usedOIDs ← flatten refMap         O(R × O) ≈ O(20)
+  2. for fn in e.functions:            O(F) = O(157)
+       if fnOverlapsOIDs(fn, usedOIDs) O(|usedOIDs|) × O(1) per ID
+         fn.Bindings() + disp.Add()
 ```
 
-After the patch, the number of closures actually allocated matches `usedOverloads` (5–15),
-not `envOverloads` (345). The `wastedOverloads` log value is unchanged — it measures
-*declared* overloads vs *referenced* overloads, independent of the binding path.
+**Trade-offs:** simplest change, no new fields on any struct, but still
+iterates all 157 functions per program.
 
-To benchmark allocation delta:
+**See:** [`patch-a/README.md`](patch-a/README.md)
 
-```bash
-go test -run='^$' \
-  -bench='BenchmarkCompileFresh\|BenchmarkProgram' \
-  -benchmem -count=3 \
-  ./staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/
+---
+
+### Patch B — OID→FunctionDecl index cached on `Env`
+
+**Folder:** [`patch-b/`](patch-b/)
+**Files:** `cel/program.go`, `cel/env.go`
+
+Adds `oidToFnOnce sync.Once` + `oidToFn map[string]*FunctionDecl` fields to
+`Env` and a new `overloadIndex()` method that builds the map lazily on the
+first `newProgram` call. Each subsequent call gets the cached pointer in O(1).
+
+`newProgram` then walks `refMap` directly — one O(1) map lookup per OID — and
+deduplicates owning functions via a `seen map[*FunctionDecl]struct{}` pointer
+map. The `e.functions` loop is **eliminated from the per-program hot path**.
+
+```
+Env.overloadIndex() — called once per Env:
+  for fn in e.functions:           O(F) = O(157)
+    for o in fn.OverloadDecls():   O(total overloads) = O(345)
+      oidToFn[o.ID()] = fn
+
+newProgram (checked path):
+  oidIndex ← e.overloadIndex()    O(1) — cached pointer
+  seen     ← map[*FunctionDecl]{}
+  for ref in refMap:               O(R) ≈ O(8–30)
+    for oID in ref.OverloadIDs:    O(avgOIDs) ≈ O(1–3)
+      fn ← oidIndex[oID]           O(1)
+      if fn not in seen: Bindings() + disp.Add()
 ```
 
-## What this patch does *not* change
+**Trade-offs:** 35–150× faster per-program lookup vs Patch A at the cost of a
+~5.5 KB index per `Env` instance. Index is rebuilt automatically when `Env` is
+extended (zero-value `sync.Once` on derived Env).
 
-- Does not change CEL evaluation semantics or results.
-- Does not change what is *declared* in the env (all 157 functions remain available for
-  type-checking and future `env.Program()` calls with different expressions).
-- Does not address the `p.interpreter` / `p.dispatcher` retention across the lifetime of a
-  cached `cel.Program` — that is a separate orthogonal change.
-- Does not require any changes to Kubernetes code outside the vendor directory.
+**See:** [`patch-b/README.md`](patch-b/README.md)
+
+---
+
+### Patch C — function name stored in `ReferenceInfo` by checker
+
+**Folder:** [`patch-c/`](patch-c/)
+**Files:** `cel/program.go`, `checker/checker.go`
+
+Modifies the type-checker to write `fn.Name()` into `ReferenceInfo.Name` at
+every function-resolution site in `resolveOverload` (and the `select_optional_field`
+site in `checkOptional`). `newProgram` reads `ref.Name` directly from the AST's
+`refMap` — one O(1) lookup into `e.functions` per unique function name. No
+reverse index on `Env`, no iteration over `e.functions` at all.
+
+```
+checker.go — three resolution sites:
+  // logical AND/OR early-return path
+  checkedRef = ast.NewFunctionReference(overload.ID())
+  checkedRef.Name = fn.Name()          // ← new
+
+  // all other functions, first matching overload
+  checkedRef = ast.NewFunctionReference(overload.ID())
+  checkedRef.Name = fn.Name()          // ← new
+
+  // optional field selection
+  ref := ast.NewFunctionReference("select_optional_field")
+  ref.Name = "select_optional_field"   // ← new
+
+newProgram (checked path):
+  seen ← map[string]struct{}{}        // dedup by fn name
+  for ref in refMap:                  O(R) ≈ O(8–30)
+    fnName ← ref.Name                 O(1) — already in AST
+    if fnName == "" || len(ref.OverloadIDs) == 0:
+      continue                        // ident / constant node, not a fn call
+    if fnName in seen: continue
+    fn ← e.functions[fnName]          O(1) — direct map lookup
+    fn.Bindings() + disp.Add()
+```
+
+**Trade-offs:** tightest hot path of all three approaches (O(R) per program,
+no index overhead), at the cost of touching the checker. The `Name` field in
+`ReferenceInfo` was always empty for function references — filling it in is
+backward-compatible and makes the AST carry richer information.
+
+**See:** [`patch-c/README.md`](patch-c/README.md)
+
+---
+
+## Complexity summary
+
+| Metric | Upstream | Patch A | Patch B | Patch C |
+|---|---|---|---|---|
+| Per-program `Bindings()` calls | 157 | ~4–15 | ~4–15 | ~4–15 |
+| Per-program dispatcher entries | ~345 | ~10–30 | ~10–30 | ~10–30 |
+| Per-program `e.functions` iterations | 157 | 157 | 0 | 0 |
+| Env-level index overhead | 0 | 0 | ~5.5 KB | 0 |
+| Checker change required | no | no | no | yes |
+
+---
+
+## Safety (all approaches)
+
+- **Unchecked AST**: `a.IsChecked()` false → original full loop. Zero behaviour change.
+- **Checked AST, empty refMap**: `len(refMap) == 0` → original full loop.
+- **Planner PATH-3 bypass operators** (`_&&_`, `_||_`, `_?_:_`, etc.): these
+  operators are planned without consulting the dispatcher; they produce no
+  `OverloadIDs` in `refMap` or are reached by function-name fallback. All
+  approaches handle this correctly — either via `fn.Bindings()` which always
+  adds the fn-name key, or via direct `e.functions[fnName]` lookup.
+- **Env extensions**: all three approaches are safe — Patch B rebuilds its
+  index via a zero-value `sync.Once` on the derived `Env`.
+
+---
 
 ## Apply
 
 ```bash
-git apply issue-131417/patches/0013-cel-reduce-overload-bindings/0013-celgo-reduce-overload-bindings.patch
+# Patch A
+git apply 0013-cel-reduce-overload-bindings/patch-a/0013-celgo-reduce-overload-bindings.patch
+
+# Patch B
+git apply 0013-cel-reduce-overload-bindings/patch-b/0013-celgo-reduce-overload-bindings-patch-b.patch
+
+# Patch C
+git apply 0013-cel-reduce-overload-bindings/patch-c/0013-celgo-reduce-overload-bindings-patch-c.patch
 ```
-
-## Upstream path
-
-The same change can be proposed upstream to `cel-go` as a `cel.ProgramOption` or a
-change to `newProgram` itself. The `ast.ReferenceMap()` API is public and stable in
-v0.26+. A cleaner upstream API would be `cel.BindingFilter(func(fnName, overloadID string) bool)`
-passed as a `ProgramOption`, allowing callers to customise the filtering strategy without
-forking `program.go`.
