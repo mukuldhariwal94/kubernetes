@@ -1,0 +1,79 @@
+diff --git a/vendor/github.com/google/cel-go/cel/program.go b/vendor/github.com/google/cel-go/cel/program.go
+index 24f41a4a77e..e7d00769110 100644
+--- a/vendor/github.com/google/cel-go/cel/program.go
++++ b/vendor/github.com/google/cel-go/cel/program.go
+@@ -191,15 +191,38 @@ func newProgram(e *Env, a *ast.AST, opts []ProgramOption) (Program, error) {
+ 		}
+ 	}
+ 
+-	// Add the function bindings created via Function() options.
+-	for _, fn := range e.functions {
+-		bindings, err := fn.Bindings()
+-		if err != nil {
+-			return nil, err
++	refMap := a.ReferenceMap()
++	if a.IsChecked() && len(refMap) != 0 {
++		// Checked AST: build the set of overload IDs actually used by this expression
++		// and only add bindings for functions that have at least one matching overload.
++		usedOIDs := make(map[string]struct{}, len(refMap))
++		for _, ref := range refMap {
++			for _, oID := range ref.OverloadIDs {
++				usedOIDs[oID] = struct{}{}
++			}
+ 		}
+-		err = disp.Add(bindings...)
+-		if err != nil {
+-			return nil, err
++		for _, fn := range e.functions {
++			if !fn.OverlapsOIDs(usedOIDs) {
++				continue
++			}
++			bindings, err := fn.Bindings()
++			if err != nil {
++				return nil, err
++			}
++			if err = disp.Add(bindings...); err != nil {
++				return nil, err
++			}
++		}
++	} else {
++		// Unchecked AST or empty ref-map: add all function bindings as before.
++		for _, fn := range e.functions {
++			bindings, err := fn.Bindings()
++			if err != nil {
++				return nil, err
++			}
++			if err = disp.Add(bindings...); err != nil {
++				return nil, err
++			}
+ 		}
+ 	}
+ 
+diff --git a/vendor/github.com/google/cel-go/common/decls/decls.go b/vendor/github.com/google/cel-go/common/decls/decls.go
+index a4a51c3f282..4aa05b9930b 100644
+--- a/vendor/github.com/google/cel-go/common/decls/decls.go
++++ b/vendor/github.com/google/cel-go/common/decls/decls.go
+@@ -290,6 +290,23 @@ func (f *FunctionDecl) AddOverload(overload *OverloadDecl) error {
+ 	return nil
+ }
+ 
++// OverlapsOIDs reports whether any overload declared by this function appears
++// in usedOIDs. It iterates f.overloads (typically 1–4 entries — the smaller,
++// constant side of the intersection) and performs one O(1) lookup into
++// usedOIDs per entry, which is cheaper than iterating usedOIDs (up to ~20
++// entries) and probing f.overloads for each.
++func (f *FunctionDecl) OverlapsOIDs(usedOIDs map[string]struct{}) bool {
++	if f == nil {
++		return false
++	}
++	for id := range f.overloads {
++		if _, ok := usedOIDs[id]; ok {
++			return true
++		}
++	}
++	return false
++}
++
+ // OverloadDecls returns the overload declarations in the order in which they were declared.
+ func (f *FunctionDecl) OverloadDecls() []*OverloadDecl {
+ 	var emptySet []*OverloadDecl

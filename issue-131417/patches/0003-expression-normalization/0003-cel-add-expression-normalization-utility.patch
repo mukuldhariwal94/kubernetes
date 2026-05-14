@@ -1,0 +1,242 @@
+diff --git a/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/normalize.go b/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/normalize.go
+new file mode 100644
+index 00000000000..3ff52c98519
+--- /dev/null
++++ b/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/normalize.go
+@@ -0,0 +1,138 @@
++/*
++Copyright 2026 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package cel
++
++import (
++	"strings"
++	"unicode"
++)
++
++// NormalizeExpression returns a canonical form of the given CEL expression
++// suitable for use as a key in compilation caches.
++//
++// Normalization improves cache hit rates by collapsing cosmetically-different
++// but semantically identical expressions into the same string. It is
++// intentionally conservative:
++//
++//   - Leading and trailing whitespace are removed.
++//   - Trailing whitespace on each internal line is removed.
++//   - Windows-style CRLF line endings are converted to LF.
++//   - Internal whitespace inside a line, and whitespace inside string
++//     literals, are preserved verbatim. This is critical because changing
++//     them could shift the line/column positions surfaced by cel-go in
++//     compilation error messages, breaking error UX.
++//
++// The transform is idempotent: NormalizeExpression(NormalizeExpression(s))
++// equals NormalizeExpression(s) for all s.
++//
++// This function is safe to call concurrently and is allocation-free for
++// expressions that are already in canonical form.
++func NormalizeExpression(expr string) string {
++	if expr == "" {
++		return expr
++	}
++
++	// Fast path: scan once. If the expression is already canonical (no CR,
++	// no leading/trailing whitespace overall, no trailing whitespace on any
++	// line), return it unchanged.
++	if isAlreadyCanonical(expr) {
++		return expr
++	}
++
++	// Slow path. Build the normalized result.
++	expr = strings.TrimSpace(expr)
++	if !strings.ContainsAny(expr, "\r\n") {
++		return expr
++	}
++
++	var b strings.Builder
++	b.Grow(len(expr))
++	for i := 0; i < len(expr); {
++		// Find next end-of-line.
++		j := i
++		for j < len(expr) && expr[j] != '\n' && expr[j] != '\r' {
++			j++
++		}
++		// Trim trailing whitespace within the line.
++		end := j
++		for end > i && isASCIIWhitespace(expr[end-1]) {
++			end--
++		}
++		b.WriteString(expr[i:end])
++		// Handle line terminator.
++		if j < len(expr) {
++			if expr[j] == '\r' && j+1 < len(expr) && expr[j+1] == '\n' {
++				b.WriteByte('\n')
++				j += 2
++			} else if expr[j] == '\r' {
++				b.WriteByte('\n')
++				j++
++			} else { // '\n'
++				b.WriteByte('\n')
++				j++
++			}
++		}
++		i = j
++	}
++	// TrimSpace already removed surrounding whitespace; the loop preserved
++	// internal newlines but may have left a trailing '\n' if the original
++	// input ended on a blank line that survived TrimSpace. Trim once more
++	// for idempotency.
++	return strings.TrimRightFunc(b.String(), unicode.IsSpace)
++}
++
++// isAlreadyCanonical reports whether s satisfies the contract of
++// NormalizeExpression without any modification.
++func isAlreadyCanonical(s string) bool {
++	if s == "" {
++		return true
++	}
++	if isASCIIWhitespace(s[0]) || isASCIIWhitespace(s[len(s)-1]) {
++		return false
++	}
++	prevWasNL := false
++	for i := 0; i < len(s); i++ {
++		c := s[i]
++		if c == '\r' {
++			return false
++		}
++		if c == '\n' {
++			if prevWasNL {
++				// Two consecutive newlines mean the previous line ended on
++				// a blank line — not necessarily non-canonical, but our
++				// trailing-whitespace rule allows it. We continue.
++			}
++			// Check that the byte before this newline (if any, on this
++			// line) is not whitespace.
++			if i > 0 && isASCIIWhitespace(s[i-1]) {
++				return false
++			}
++			prevWasNL = true
++			continue
++		}
++		prevWasNL = false
++	}
++	return true
++}
++
++func isASCIIWhitespace(b byte) bool {
++	switch b {
++	case ' ', '\t', '\n', '\r', '\v', '\f':
++		return true
++	}
++	return false
++}
+diff --git a/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/normalize_test.go b/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/normalize_test.go
+new file mode 100644
+index 00000000000..0520f06243c
+--- /dev/null
++++ b/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/normalize_test.go
+@@ -0,0 +1,92 @@
++/*
++Copyright 2026 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package cel
++
++import (
++	"strings"
++	"testing"
++)
++
++func TestNormalizeExpression(t *testing.T) {
++	cases := []struct {
++		name string
++		in   string
++		want string
++	}{
++		{"empty", "", ""},
++		{"already canonical", "object.x > 0", "object.x > 0"},
++		{"trims leading whitespace", "  object.x > 0", "object.x > 0"},
++		{"trims trailing whitespace", "object.x > 0\n", "object.x > 0"},
++		{"trims both", "  object.x > 0\t\n", "object.x > 0"},
++		{"preserves internal whitespace", "object.x  >  0", "object.x  >  0"},
++		{"converts CRLF to LF", "object.x > 0\r\nfoo == 'bar'", "object.x > 0\nfoo == 'bar'"},
++		{"converts standalone CR to LF", "object.x > 0\rfoo == 'bar'", "object.x > 0\nfoo == 'bar'"},
++		{"trims trailing whitespace per line", "object.x > 0   \n  foo == 'bar'  \n", "object.x > 0\n  foo == 'bar'"},
++		{"preserves whitespace inside string literal", "object.x == 'a   b'", "object.x == 'a   b'"},
++	}
++	for _, c := range cases {
++		t.Run(c.name, func(t *testing.T) {
++			got := NormalizeExpression(c.in)
++			if got != c.want {
++				t.Errorf("NormalizeExpression(%q) = %q, want %q", c.in, got, c.want)
++			}
++		})
++	}
++}
++
++func TestNormalizeExpression_Idempotent(t *testing.T) {
++	inputs := []string{
++		"",
++		"object.x > 0",
++		"  object.x > 0  ",
++		"object.x > 0\r\nfoo == 'bar'\n",
++		"  object.x > 0   \n  foo == 'bar'  \n",
++	}
++	for _, in := range inputs {
++		once := NormalizeExpression(in)
++		twice := NormalizeExpression(once)
++		if once != twice {
++			t.Errorf("not idempotent: NormalizeExpression(%q) = %q; second pass produced %q", in, once, twice)
++		}
++	}
++}
++
++func TestNormalizeExpression_LeavesAlreadyCanonicalUnchanged(t *testing.T) {
++	in := "object.spec.replicas > 0 && object.spec.replicas < 10"
++	out := NormalizeExpression(in)
++	// Identity match (same backing string when fast-path triggers) is not
++	// guaranteed by the API, but the value must be byte-for-byte equal.
++	if out != in {
++		t.Errorf("expected canonical input unchanged, got %q", out)
++	}
++}
++
++func BenchmarkNormalizeExpression_Canonical(b *testing.B) {
++	in := strings.Repeat("object.spec.replicas > 0 && ", 20) + "true"
++	b.ReportAllocs()
++	for i := 0; i < b.N; i++ {
++		_ = NormalizeExpression(in)
++	}
++}
++
++func BenchmarkNormalizeExpression_NeedsNormalization(b *testing.B) {
++	in := "  " + strings.Repeat("object.spec.replicas > 0 && ", 20) + "true   \r\n"
++	b.ReportAllocs()
++	for i := 0; i < b.N; i++ {
++		_ = NormalizeExpression(in)
++	}
++}

@@ -1,0 +1,151 @@
+From 776f7fcf8af7e2e6a432915461c92006e0250904 Mon Sep 17 00:00:00 2001
+From: mukul dhariwal <mukul.dhariwal94@gmail.com>
+Date: Thu, 7 May 2026 20:24:22 +0530
+Subject: [PATCH 9/9] vendor: cel-go: share interpreter.Dispatcher per *cel.Env
+
+Vendored change to github.com/google/cel-go targeting the #1 and #2
+retained heap nodes observed in the issue-131417 profile
+(FunctionDecl.Bindings 40.5%, defaultDispatcher.Add 22.8% --
+together ~62% of a 1.7 GB inuse heap).
+
+Before this change, cel.newProgram allocated a fresh
+interpreter.Dispatcher and populated it by walking e.functions and
+calling fn.Bindings() on every overload. The resulting dispatch
+table is byte-for-byte identical for every program built from the
+same env, but it was being copied per-program. On apiserver-shaped
+envs that's ~150 KB of dispatcher state per cel.Program, multiplied
+by every cached entry.
+
+After this change:
+
+  * Env owns a lazily-built (sync.Once) shared dispatcher populated
+    from e.functions. e.functions is immutable post-construction
+    (Env.Extend deep-copies the function map into the child env),
+    so the populated dispatcher is observationally immutable and
+    safe to share.
+  * newProgram wraps the shared dispatcher with
+    interpreter.ExtendDispatcher, yielding a tiny per-program
+    overlay. The deprecated Functions() program option, which is
+    the only ProgramOption that mutates p.dispatcher, writes to
+    the overlay and never to the shared parent.
+
+Per-program dispatcher cost drops from ~150 KB to a few hundred
+bytes. Programs built from different envs (cel.NewEnv or any
+e.Extend(...) child) get independent dispatchers, so additive
+Function() declarations on the child env behave exactly as before.
+
+Tested:
+  go test ./vendor/github.com/google/cel-go/cel/...                          PASS
+  go test ./staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/...        PASS
+  go test ./staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/...     PASS
+  go test ./staging/src/k8s.io/apiserver/pkg/cel/...                         PASS
+
+Upstream destination: google/cel-go, then re-vendored into k8s/k8s.
+---
+ vendor/github.com/google/cel-go/cel/env.go    | 35 +++++++++++++++++++
+ .../github.com/google/cel-go/cel/program.go   | 29 +++++++--------
+ 2 files changed, 48 insertions(+), 16 deletions(-)
+
+diff --git a/vendor/github.com/google/cel-go/cel/env.go b/vendor/github.com/google/cel-go/cel/env.go
+index bb3014464e5..eb8a46490d1 100644
+--- a/vendor/github.com/google/cel-go/cel/env.go
++++ b/vendor/github.com/google/cel-go/cel/env.go
+@@ -155,6 +155,41 @@ type Env struct {
+ 
+ 	// Program options tied to the environment
+ 	progOpts []ProgramOption
++
++	// Lazily-built dispatcher shared across all programs derived from this
++	// env. e.functions is immutable after env construction (Extend() copies
++	// it into a child env, leaving the parent untouched), so the dispatcher
++	// populated from it is observationally immutable too. Sharing one copy
++	// instead of populating a fresh dispatcher per newProgram saves ~150 KB
++	// per program on apiserver-shaped envs.
++	dispOnce  sync.Once
++	dispCache interpreter.Dispatcher
++	dispErr   error
++}
++
++// sharedDispatcher returns a per-env dispatcher pre-populated with every
++// overload binding from e.functions. Built once per env, lock-free on
++// subsequent calls.
++//
++// Callers must not mutate the returned Dispatcher; wrap it with
++// interpreter.ExtendDispatcher to add program-local overloads safely.
++func (e *Env) sharedDispatcher() (interpreter.Dispatcher, error) {
++	e.dispOnce.Do(func() {
++		d := interpreter.NewDispatcher()
++		for _, fn := range e.functions {
++			bindings, err := fn.Bindings()
++			if err != nil {
++				e.dispErr = err
++				return
++			}
++			if err := d.Add(bindings...); err != nil {
++				e.dispErr = err
++				return
++			}
++		}
++		e.dispCache = d
++	})
++	return e.dispCache, e.dispErr
+ }
+ 
+ // ToConfig produces a YAML-serializable env.Config object from the given environment.
+diff --git a/vendor/github.com/google/cel-go/cel/program.go b/vendor/github.com/google/cel-go/cel/program.go
+index 24f41a4a77e..f8afb3bb750 100644
+--- a/vendor/github.com/google/cel-go/cel/program.go
++++ b/vendor/github.com/google/cel-go/cel/program.go
+@@ -170,8 +170,16 @@ type prog struct {
+ //
+ // If the program cannot be configured the prog will be nil, with a non-nil error response.
+ func newProgram(e *Env, a *ast.AST, opts []ProgramOption) (Program, error) {
+-	// Build the dispatcher, interpreter, and default program value.
+-	disp := interpreter.NewDispatcher()
++	// Reuse the env's shared dispatcher for the bulk of the function bindings
++	// (every overload from e.functions is materialised exactly once per env).
++	// Wrap it with ExtendDispatcher so the deprecated Functions() ProgramOption
++	// can still register program-local overloads in an isolated overlay
++	// without mutating the shared parent.
++	parentDisp, err := e.sharedDispatcher()
++	if err != nil {
++		return nil, err
++	}
++	disp := interpreter.ExtendDispatcher(parentDisp)
+ 
+ 	// Ensure the default attribute factory is set after the adapter and provider are
+ 	// configured.
+@@ -182,8 +190,9 @@ func newProgram(e *Env, a *ast.AST, opts []ProgramOption) (Program, error) {
+ 		costOptions:    []interpreter.CostTrackerOption{},
+ 	}
+ 
+-	// Configure the program via the ProgramOption values.
+-	var err error
++	// Configure the program via the ProgramOption values. The deprecated
++	// Functions() option mutates p.dispatcher, which is the per-program
++	// overlay above, not the shared parent.
+ 	for _, opt := range opts {
+ 		p, err = opt(p)
+ 		if err != nil {
+@@ -191,18 +200,6 @@ func newProgram(e *Env, a *ast.AST, opts []ProgramOption) (Program, error) {
+ 		}
+ 	}
+ 
+-	// Add the function bindings created via Function() options.
+-	for _, fn := range e.functions {
+-		bindings, err := fn.Bindings()
+-		if err != nil {
+-			return nil, err
+-		}
+-		err = disp.Add(bindings...)
+-		if err != nil {
+-			return nil, err
+-		}
+-	}
+-
+ 	// Set the attribute factory after the options have been set.
+ 	var attrFactory interpreter.AttributeFactory
+ 	attrFactorOpts := []interpreter.AttrFactoryOption{
+-- 
+2.39.3 (Apple Git-146)
+

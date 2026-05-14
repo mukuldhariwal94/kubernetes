@@ -1,0 +1,56 @@
+From 1c91ba1a9adbcd9e1eb6c32bdc677265e8012bd3 Mon Sep 17 00:00:00 2001
+From: mukul dhariwal <mukul.dhariwal94@gmail.com>
+Date: Thu, 7 May 2026 20:23:57 +0530
+Subject: [PATCH 8/9] cel: shrink process-wide compile-cache cap to 1500
+
+Prerequisite: patch 0001 (process-wide compiled-program cache). This patch
+only tweaks the defaultCompileCacheSize constant and its doc comment in
+compile_cache.go, which 0001 creates -- so it cannot be applied to a bare
+master, only on top of 0001. Apply 0001 first.
+
+Heap profiles from a real apiserver (issue-131417, snapshot at 1.7 GB
+inuse) show the cel.Program retained per cache entry is ~150-250 KB
+once you account for the per-program FunctionDecl.Bindings copy and
+the interpreter dispatcher table populated from it. The previous
+5000-entry cap was sized against a ~30-200 KB per-program estimate
+that pre-dated the apiserver-shaped env (urls/ip/cidr/regex/jsonpatch/
+quantity/semver/lists libraries), so in practice the cache could grow
+to ~1 GB on its own.
+
+Drop the cap to 1500. At the empirical per-entry cost this caps the
+cache footprint at ~300-400 MB. Templated workloads (the case that
+benefits most from program-level dedup) only need a few hundred
+distinct keys, so the hit rate is preserved.
+
+Pairs with the cel-go shared-dispatcher change, which removes the
+bulk of the per-entry retained cost; once that lands the cap can be
+revisited upward.
+---
+ .../pkg/admission/plugin/cel/compile_cache.go         | 11 +++++++----
+ 1 file changed, 7 insertions(+), 4 deletions(-)
+
+diff --git a/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/compile_cache.go b/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/compile_cache.go
+index e0453607ad5..be6ebfb31ef 100644
+--- a/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/compile_cache.go
++++ b/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/compile_cache.go
+@@ -37,10 +37,13 @@ func reflectPointer(p *environment.EnvSet) uintptr {
+ }
+ 
+ // defaultCompileCacheSize bounds how many distinct compiled CEL programs are
+-// kept in the process-wide cache. Each entry holds one cel.Program (typically
+-// 30-200 KB), so 5000 entries cap the cache footprint at a few hundred MB
+-// even on pathological clusters.
+-const defaultCompileCacheSize = 5000
++// kept in the process-wide cache. Empirical apiserver heap profiles put the
++// retained cost of a single cel.Program at ~150-250 KB (the per-program
++// FunctionDecl.Bindings + interpreter Dispatcher copy dominate, see
++// issue-131417). 1500 entries caps the cache footprint at ~300-400 MB on
++// clusters with thousands of distinct expressions while preserving near-
++// optimal hit rates on templated workloads.
++const defaultCompileCacheSize = 1500
+ 
+ var (
+ 	// globalCompileCache is swapped via atomic.Pointer so the hot path of
+-- 
+2.39.3 (Apple Git-146)
+

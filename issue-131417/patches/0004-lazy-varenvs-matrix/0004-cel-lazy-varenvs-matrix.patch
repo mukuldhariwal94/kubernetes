@@ -1,0 +1,194 @@
+From cc7d30adaeb80b39bdfd4eaf533973a36a6b05df Mon Sep 17 00:00:00 2001
+From: VAP Memory Optimization <noreply@example.com>
+Date: Mon, 11 May 2026 19:42:16 +0530
+Subject: [PATCH] cel: build varEnvs lazily instead of materializing all 8
+ combos
+
+Prerequisite: patch 0001 (process-wide compiled-program cache). This patch
+modifies the compiler struct / newCachedCompiler / compileFresh introduced
+by 0001 and the "strings" import it adds. It also touches the same region
+as patch 0010 ("lazify per-compiler varEnvs") and is mutually exclusive
+with it -- 0004 keeps the per-compiler BuildNamespaceType/BuildRequestType
+calls, 0010 additionally hoists those into process-wide singletons.
+
+Today every `compiler` (one per `CompositedCompiler`, one per policy in the
+absence of patch 0002) eagerly builds 8 EnvSets in `mustBuildEnvs` covering the
+Cartesian product of {HasParams, HasAuthorizer, HasPatchTypes}. Each EnvSet is
+two cel-go `cel.Env.Extend` clones, so the matrix costs 16 env clones per
+compiler -- independent of how many of those combos a given policy will
+actually use.
+
+In production:
+  - VAP uses 2 of 8 combos (validations vs messageExpressions differ only on
+    HasAuthorizer; HasPatchTypes is MAP-only).
+  - MAP uses up to 4 of 8.
+
+That's 75% wasted matrix capacity per unique compiler instance. After patches
+0001/0002, this is the dominant residual `F` cost paid by policies that 0002
+cannot collapse (i.e. those whose variable signatures differ).
+
+This patch converts `varEnvs` to a lazy memoized table keyed by
+OptionalVariableDeclarations, materialized on first use via sync.Once-per-key.
+The materialized table (envs) and the per-key once table (once) are held by
+pointer on the compiler struct so the value-receiver compiler methods all
+observe one shared table. Semantics are unchanged: createEnvForOpts is pure
+with respect to its inputs, so memoization is observationally invisible.
+
+Expected savings: ~3/4 of per-compiler env-clone heap on the 0002-miss path.
+Estimated 1-4 GiB at 10,000 unique-shape policies.
+
+Tested:
+  go build  ./staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/...   OK
+  go vet    ./staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/...   OK
+  go test   ./staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/...           PASS
+  go test   ./staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/...        PASS
+---
+ .../pkg/admission/plugin/cel/compile.go       | 96 +++++++++++++------
+ 1 file changed, 65 insertions(+), 31 deletions(-)
+
+diff --git a/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/compile.go b/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/compile.go
+index a4d102e138a..3bb097d9c80 100644
+--- a/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/compile.go
++++ b/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/compile.go
+@@ -19,6 +19,7 @@ package cel
+ import (
+ 	"fmt"
+ 	"strings"
++	"sync"
+ 
+ 	"github.com/google/cel-go/cel"
+ 
+@@ -154,7 +155,19 @@ type Compiler interface {
+ }
+ 
+ type compiler struct {
+-	varEnvs variableDeclEnvs
++	// base / namespace / request feed lazy varEnvs construction.
++	base      *environment.EnvSet
++	namespace *apiservercel.DeclType
++	request   *apiservercel.DeclType
++
++	// envs holds the per-OptionalVariableDeclarations EnvSets materialized so
++	// far; once populated for a key, it is never invalidated for the lifetime
++	// of the compiler. Access for a missing key is gated by once[key] so that
++	// concurrent first-use callers share one construction. Both are pointers
++	// so the value-receiver compiler methods observe a single shared table.
++	envs *sync.Map // OptionalVariableDeclarations -> *environment.EnvSet
++	once *sync.Map // OptionalVariableDeclarations -> *sync.Once
++
+ 	// templateID identifies the env template (e.g. the singleton
+ 	// `getCompositionEnvTemplateWithStrictCost()`) that this compiler was
+ 	// derived from. Two compilers built from the same template are
+@@ -178,7 +191,13 @@ type compiler struct {
+ // not connected to the process-wide program cache (use NewCompositedCompiler
+ // to opt in via a stable env template).
+ func NewCompiler(env *environment.EnvSet) Compiler {
+-	return &compiler{varEnvs: mustBuildEnvs(env)}
++	return &compiler{
++		base:      env,
++		namespace: BuildNamespaceType(),
++		request:   BuildRequestType(),
++		envs:      &sync.Map{},
++		once:      &sync.Map{},
++	}
+ }
+ 
+ // newCachedCompiler returns a Compiler that participates in the process-wide
+@@ -186,12 +205,45 @@ func NewCompiler(env *environment.EnvSet) Compiler {
+ // env template used to derive env). Internal helper for CompositedCompiler.
+ func newCachedCompiler(env *environment.EnvSet, templateID *environment.EnvSet) *compiler {
+ 	return &compiler{
+-		varEnvs:    mustBuildEnvs(env),
++		base:       env,
++		namespace:  BuildNamespaceType(),
++		request:    BuildRequestType(),
++		envs:       &sync.Map{},
++		once:       &sync.Map{},
+ 		templateID: templateID,
+ 	}
+ }
+ 
+-type variableDeclEnvs map[OptionalVariableDeclarations]*environment.EnvSet
++// envFor returns the EnvSet for the given OptionalVariableDeclarations,
++// constructing it on first use. Concurrent callers requesting the same key
++// share one construction via sync.Once; concurrent callers requesting
++// different keys make progress independently. Replaces the eager 8-entry
++// matrix that mustBuildEnvs used to materialize for every compiler — in
++// production VAP only ever asks for 2 of those 8 combinations and MAP for 4.
++func (c compiler) envFor(opts OptionalVariableDeclarations) (*environment.EnvSet, error) {
++	if v, ok := c.envs.Load(opts); ok {
++		return v.(*environment.EnvSet), nil
++	}
++	onceI, _ := c.once.LoadOrStore(opts, &sync.Once{})
++	var buildErr error
++	onceI.(*sync.Once).Do(func() {
++		es, err := createEnvForOpts(c.base, c.namespace, c.request, opts)
++		if err != nil {
++			buildErr = err
++			return
++		}
++		c.envs.Store(opts, es)
++	})
++	if buildErr != nil {
++		// Allow a future caller to retry by clearing the once entry. This
++		// matches the previous eager semantics, where a transient
++		// configuration error would surface at every compile attempt.
++		c.once.Delete(opts)
++		return nil, buildErr
++	}
++	v, _ := c.envs.Load(opts)
++	return v.(*environment.EnvSet), nil
++}
+ 
+ // CompileCELExpression returns a compiled CEL expression.
+ // perCallLimit was added for testing purpose only. Callers should always use const PerCallLimit from k8s.io/apiserver/pkg/apis/cel/config.go as input.
+@@ -266,7 +318,11 @@ func (c compiler) compileFresh(expressionAccessor ExpressionAccessor, options Op
+ 		}
+ 	}
+ 
+-	env, err := c.varEnvs[options].Env(envType)
++	envSet, err := c.envFor(options)
++	if err != nil {
++		return resultError(fmt.Sprintf("unexpected error loading CEL environment: %v", err), apiservercel.ErrorTypeInternal, nil)
++	}
++	env, err := envSet.Env(envType)
+ 	if err != nil {
+ 		return resultError(fmt.Sprintf("unexpected error loading CEL environment: %v", err), apiservercel.ErrorTypeInternal, nil)
+ 	}
+@@ -312,32 +368,10 @@ func (c compiler) compileFresh(expressionAccessor ExpressionAccessor, options Op
+ 	}
+ }
+ 
+-func mustBuildEnvs(baseEnv *environment.EnvSet) variableDeclEnvs {
+-	requestType := BuildRequestType()
+-	namespaceType := BuildNamespaceType()
+-	envs := make(variableDeclEnvs, 8) // since the number of variable combinations is small, pre-build a environment for each
+-	for _, hasParams := range []bool{false, true} {
+-		for _, hasAuthorizer := range []bool{false, true} {
+-			var err error
+-			{
+-				decl := OptionalVariableDeclarations{HasParams: hasParams, HasAuthorizer: hasAuthorizer}
+-				envs[decl], err = createEnvForOpts(baseEnv, namespaceType, requestType, decl)
+-				if err != nil {
+-					panic(err)
+-				}
+-			}
+-			{
+-				decl := OptionalVariableDeclarations{HasParams: hasParams, HasAuthorizer: hasAuthorizer, HasPatchTypes: true}
+-				envs[decl], err = createEnvForOpts(baseEnv, namespaceType, requestType, decl)
+-				if err != nil {
+-					panic(err)
+-				}
+-			}
+-		}
+-	}
+-	return envs
+-}
+-
++// createEnvForOpts builds the EnvSet for a single OptionalVariableDeclarations
++// combination. It is the single point where a per-(opts) environment is
++// materialized; compiler.envFor now invokes it lazily on first use rather than
++// mustBuildEnvs eagerly precomputing the full 8-entry Cartesian product.
+ func createEnvForOpts(baseEnv *environment.EnvSet, namespaceType *apiservercel.DeclType, requestType *apiservercel.DeclType, opts OptionalVariableDeclarations) (*environment.EnvSet, error) {
+ 	var envOpts []cel.EnvOption
+ 	envOpts = append(envOpts,

@@ -1,0 +1,194 @@
+From 31509b3efff15a95ff5b308129aabf5270f3081a Mon Sep 17 00:00:00 2001
+From: VAP Memory Optimization <noreply@example.com>
+Date: Mon, 11 May 2026 19:53:49 +0530
+Subject: [PATCH] cel: skip the `variables` Extend when policy has zero
+ variables
+
+Prerequisite: patch 0001 (process-wide compiled-program cache). NewSimpleCompiler
+calls newCachedCompiler, which 0001 introduces. Apply 0001 first. (This patch
+does not touch compile.go, so it is independent of patches 0004/0005/0010.)
+
+`NewCompositedCompiler` unconditionally extends the env template with a
+`variables` declType -- even when the calling policy has no `variables`. For
+zero-variable policies (a substantial fraction of real-world VAPs), this adds:
+
+  1. Two extra cel-go env clones (NewExpressions + StoredExpressions).
+  2. An extra link in the apiservercel.NewDeclTypeProvider chain, deepening
+     every type lookup at compile *and* runtime.
+  3. A `lazy.MapValue` allocation per request inside compositionContext.Variables.
+
+Since a zero-variable policy cannot legally reference `variables.x` (that's a
+compile error), skipping the variables decl cannot change the set of programs
+that compile or evaluate successfully. This patch:
+
+  - Adds a sentinel (`mapType == nil`) to compositionState meaning
+    "composition disabled".
+  - Adds NewSimpleCompiler that constructs a CompositedCompiler in this mode.
+  - Wires validating/plugin.go and mutating/compilation.go to use the simple
+    constructor when policy.Spec.Variables is empty (and to skip the now-empty
+    CompileAndStoreVariables call in that case).
+  - Returns a process-wide empty lazy map (emptyVariablesMap) at runtime so
+    per-request allocation is eliminated for zero-variable policies.
+
+Estimated savings: ~20-80 KB per zero-variable policy plus per-request lazy
+map churn elimination. ~200 MiB-800 MiB on a 10,000-policy cluster where ~50%
+of policies are zero-variable.
+
+Tested:
+  go build  ./staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/... ./.../policy/...   OK
+  go vet    (same packages)                                                                OK
+  go test   ./staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/...                     PASS
+  go test   ./staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/...                  PASS
+---
+ .../pkg/admission/plugin/cel/composition.go   | 57 +++++++++++++++++++
+ .../plugin/policy/mutating/compilation.go     | 17 +++++-
+ .../plugin/policy/validating/plugin.go        | 16 +++++-
+ 3 files changed, 86 insertions(+), 4 deletions(-)
+
+diff --git a/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/composition.go b/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/composition.go
+index 7e7ddf69651..07a5554fb10 100644
+--- a/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/composition.go
++++ b/staging/src/k8s.io/apiserver/pkg/admission/plugin/cel/composition.go
+@@ -38,6 +38,16 @@ import (
+ 
+ const variablesTypeName = "kubernetes.variables"
+ 
++// emptyVariablesMap is the singleton empty `variables` ref.Val returned by
++// compositionContext.Variables for compilers built via NewSimpleCompiler.
++// It is constructed once at package init and is safe to share across requests:
++// lazy.MapValue exposes only read paths, and a zero-variable policy can never
++// legally reference `variables.x` (that is a compile error).
++var emptyVariablesMap = func() ref.Val {
++	emptyType := apiservercel.NewObjectType(variablesTypeName, map[string]*apiservercel.DeclField{})
++	return lazy.NewMapValue(emptyType)
++}()
++
+ // CompositedCompiler compiles expressions with variable composition.
+ type CompositedCompiler struct {
+ 	Compiler
+@@ -104,6 +114,46 @@ func NewCompositedCompiler(envSet *environment.EnvSet) (*CompositedCompiler, err
+ 	}, nil
+ }
+ 
++// NewSimpleCompiler returns a CompositedCompiler tailored for policies that
++// declare no `variables`. Relative to NewCompositedCompiler it skips:
++//
++//   - the per-policy `variables` Extend (two cel-go env clones, plus an extra
++//     link in the apiservercel type-provider chain consulted at every lookup),
++//   - the mutable `mapType` on the composition state (left nil as the sentinel
++//     meaning "composition disabled"), and
++//   - the per-request lazy.MapValue allocation in compositionContext.Variables
++//     (a process-wide empty map is returned instead).
++//
++// Callers MUST NOT call CompileAndStoreVariables / CompileAndStoreVariable on
++// the returned compiler — there is no mapType to register fields on. Aside from
++// the absence of the `variables` identifier in scope, CompileCondition /
++// CompileMutatingEvaluator behave identically to the NewCompositedCompiler
++// path, which is sound because a zero-variable policy cannot reference
++// `variables` without a compile error.
++func NewSimpleCompiler(envSet *environment.EnvSet) (*CompositedCompiler, error) {
++	state := &compositionState{
++		EnvSet:            envSet,
++		mapType:           nil, // sentinel: composition disabled
++		compiledVariables: map[string]CompilationResult{},
++	}
++
++	// Key the cached compiler by the *base* env template (envSet), exactly as
++	// NewCompositedCompiler does, so the two share entries in the process-wide
++	// program cache for expressions that don't reference `variables`. No
++	// variableSigFn is wired: these compilers cannot reference `variables`, so
++	// the cache key correctly omits the (always-empty) variable signature.
++	baseCompiler := newCachedCompiler(state.EnvSet, envSet)
++
++	conditionCompiler := &conditionCompiler{baseCompiler}
++	mutation := &mutatingCompiler{baseCompiler}
++	return &CompositedCompiler{
++		Compiler:          baseCompiler,
++		ConditionCompiler: conditionCompiler,
++		MutatingCompiler:  mutation,
++		state:             state,
++	}, nil
++}
++
+ // NewCompositedCompilerForTypeChecking creates a CompositedCompiler for type checking.
+ // It initializes the composition state but leaves the Compilers nil, as they are expected
+ // to be replaced by the caller (who is doing type checking).
+@@ -233,6 +283,13 @@ type compositionContext struct {
+ }
+ 
+ func (c *compositionContext) Variables(activation any) ref.Val {
++	if c.state.mapType == nil {
++		// Composition disabled (NewSimpleCompiler path). Returning the shared
++		// empty lazy map is observationally equivalent to a freshly-built empty
++		// one for any expression that does not reference `variables` — and a
++		// zero-variable policy cannot legally reference it.
++		return emptyVariablesMap
++	}
+ 	lazyMap := lazy.NewMapValue(c.state.mapType)
+ 	for name, result := range c.state.compiledVariables {
+ 		accessor := &variableAccessor{
+diff --git a/staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/mutating/compilation.go b/staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/mutating/compilation.go
+index a0772aab441..f2be568adec 100644
+--- a/staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/mutating/compilation.go
++++ b/staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/mutating/compilation.go
+@@ -35,7 +35,18 @@ import (
+ // returned is a PolicyEvaluator in the same order as the mutations appeared in the policy.
+ func compilePolicy(policy *v1.MutatingAdmissionPolicy) PolicyEvaluator {
+ 	opts := plugincel.OptionalVariableDeclarations{HasParams: policy.Spec.ParamKind != nil, HasAuthorizer: true}
+-	compiler, err := plugincel.NewCompositedCompiler(environment.MustBaseEnvSet(environment.DefaultCompatibilityVersion()))
++	envTemplate := environment.MustBaseEnvSet(environment.DefaultCompatibilityVersion())
++	var (
++		compiler *plugincel.CompositedCompiler
++		err      error
++	)
++	if len(policy.Spec.Variables) == 0 {
++		// Zero-variable fast path: skip the `variables` Extend, the composition
++		// state mapType, and the per-request lazy map allocation.
++		compiler, err = plugincel.NewSimpleCompiler(envTemplate)
++	} else {
++		compiler, err = plugincel.NewCompositedCompiler(envTemplate)
++	}
+ 	if err != nil {
+ 		return PolicyEvaluator{Error: &apiservercel.Error{
+ 			Type:   apiservercel.ErrorTypeInternal,
+@@ -44,7 +55,9 @@ func compilePolicy(policy *v1.MutatingAdmissionPolicy) PolicyEvaluator {
+ 	}
+ 
+ 	// Compile and store variables
+-	compiler.CompileAndStoreVariables(convertV1Variables(policy.Spec.Variables), opts, environment.StoredExpressions)
++	if len(policy.Spec.Variables) > 0 {
++		compiler.CompileAndStoreVariables(convertV1Variables(policy.Spec.Variables), opts, environment.StoredExpressions)
++	}
+ 
+ 	// Compile matchers
+ 	var matcher matchconditions.Matcher = nil
+diff --git a/staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/validating/plugin.go b/staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/validating/plugin.go
+index 348ecde2d0e..fbfdbcf821c 100644
+--- a/staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/validating/plugin.go
++++ b/staging/src/k8s.io/apiserver/pkg/admission/plugin/policy/validating/plugin.go
+@@ -155,11 +155,23 @@ func compilePolicy(policy *Policy) Validator {
+ 	var matcher matchconditions.Matcher = nil
+ 	matchConditions := policy.Spec.MatchConditions
+ 	compositionEnvTemplate := getCompositionEnvTemplateWithStrictCost()
+-	filterCompiler, err := cel.NewCompositedCompiler(compositionEnvTemplate)
++	var (
++		filterCompiler *cel.CompositedCompiler
++		err            error
++	)
++	if len(policy.Spec.Variables) == 0 {
++		// Zero-variable fast path: skip the `variables` Extend, the composition
++		// state mapType, and the per-request lazy map allocation.
++		filterCompiler, err = cel.NewSimpleCompiler(compositionEnvTemplate)
++	} else {
++		filterCompiler, err = cel.NewCompositedCompiler(compositionEnvTemplate)
++	}
+ 	if err != nil {
+ 		return NewValidator(nil, nil, nil, nil, failurePolicy, err)
+ 	}
+-	filterCompiler.CompileAndStoreVariables(convertv1beta1Variables(policy.Spec.Variables), optionalVars, environment.StoredExpressions)
++	if len(policy.Spec.Variables) > 0 {
++		filterCompiler.CompileAndStoreVariables(convertv1beta1Variables(policy.Spec.Variables), optionalVars, environment.StoredExpressions)
++	}
+ 
+ 	if len(matchConditions) > 0 {
+ 		matchExpressionAccessors := make([]cel.ExpressionAccessor, len(matchConditions))
