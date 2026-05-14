@@ -53,20 +53,10 @@ diff --git a/vendor/github.com/google/cel-go/common/decls/decls.go b/vendor/gith
 index a4a51c3f282..4aa05b9930b 100644
 --- a/vendor/github.com/google/cel-go/common/decls/decls.go
 +++ b/vendor/github.com/google/cel-go/common/decls/decls.go
-@@ -290,6 +290,33 @@ func (f *FunctionDecl) AddOverload(overload *OverloadDecl) error {
+@@ -290,6 +290,23 @@ func (f *FunctionDecl) AddOverload(overload *OverloadDecl) error {
  	return nil
  }
  
-+// HasOverloadID reports whether the function declares an overload with the given ID.
-+// Uses the internal map directly — O(1), no slice allocation.
-+func (f *FunctionDecl) HasOverloadID(id string) bool {
-+	if f == nil {
-+		return false
-+	}
-+	_, ok := f.overloads[id]
-+	return ok
-+}
-+
 +// OverlapsOIDs reports whether any overload declared by this function appears
 +// in usedOIDs. It iterates f.overloads (typically 1–4 entries — the smaller,
 +// constant side of the intersection) and performs one O(1) lookup into
