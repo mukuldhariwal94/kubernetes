@@ -1,16 +1,8 @@
 diff --git a/vendor/github.com/google/cel-go/cel/program.go b/vendor/github.com/google/cel-go/cel/program.go
-index 24f41a4a77e..5b2e1701ebf 100644
+index 24f41a4a77e..e7d00769110 100644
 --- a/vendor/github.com/google/cel-go/cel/program.go
 +++ b/vendor/github.com/google/cel-go/cel/program.go
-@@ -20,6 +20,7 @@ import (
- 	"sync"
- 
- 	"github.com/google/cel-go/common/ast"
-+	"github.com/google/cel-go/common/decls"
- 	"github.com/google/cel-go/common/types"
- 	"github.com/google/cel-go/common/types/ref"
- 	"github.com/google/cel-go/interpreter"
-@@ -191,15 +192,38 @@ func newProgram(e *Env, a *ast.AST, opts []ProgramOption) (Program, error) {
+@@ -191,15 +191,38 @@ func newProgram(e *Env, a *ast.AST, opts []ProgramOption) (Program, error) {
  		}
  	}
  
@@ -33,7 +25,7 @@ index 24f41a4a77e..5b2e1701ebf 100644
 -		if err != nil {
 -			return nil, err
 +		for _, fn := range e.functions {
-+			if !fnOverlapsOIDs(fn, usedOIDs) {
++			if !fn.OverlapsOIDs(usedOIDs) {
 +				continue
 +			}
 +			bindings, err := fn.Bindings()
@@ -57,30 +49,11 @@ index 24f41a4a77e..5b2e1701ebf 100644
  		}
  	}
  
-@@ -486,6 +510,18 @@ func (p *evalActivationPool) Put(value any) {
- 	p.Pool.Put(a)
- }
- 
-+// fnOverlapsOIDs reports whether fn declares at least one overload whose ID
-+// appears in usedOIDs. It iterates usedOIDs (typically 5–20 entries) and calls
-+// fn.HasOverloadID for each, avoiding the slice allocation of OverloadDecls().
-+func fnOverlapsOIDs(fn *decls.FunctionDecl, usedOIDs map[string]struct{}) bool {
-+	for oID := range usedOIDs {
-+		if fn.HasOverloadID(oID) {
-+			return true
-+		}
-+	}
-+	return false
-+}
-+
- var (
- 	// activationPool is an internally managed pool of Activation values that wrap map[string]any inputs
- 	activationPool = newEvalActivationPool()
 diff --git a/vendor/github.com/google/cel-go/common/decls/decls.go b/vendor/github.com/google/cel-go/common/decls/decls.go
-index a4a51c3f282..2acc3762b2e 100644
+index a4a51c3f282..4aa05b9930b 100644
 --- a/vendor/github.com/google/cel-go/common/decls/decls.go
 +++ b/vendor/github.com/google/cel-go/common/decls/decls.go
-@@ -290,6 +290,16 @@ func (f *FunctionDecl) AddOverload(overload *OverloadDecl) error {
+@@ -290,6 +290,33 @@ func (f *FunctionDecl) AddOverload(overload *OverloadDecl) error {
  	return nil
  }
  
@@ -92,6 +65,23 @@ index a4a51c3f282..2acc3762b2e 100644
 +	}
 +	_, ok := f.overloads[id]
 +	return ok
++}
++
++// OverlapsOIDs reports whether any overload declared by this function appears
++// in usedOIDs. It iterates f.overloads (typically 1–4 entries — the smaller,
++// constant side of the intersection) and performs one O(1) lookup into
++// usedOIDs per entry, which is cheaper than iterating usedOIDs (up to ~20
++// entries) and probing f.overloads for each.
++func (f *FunctionDecl) OverlapsOIDs(usedOIDs map[string]struct{}) bool {
++	if f == nil {
++		return false
++	}
++	for id := range f.overloads {
++		if _, ok := usedOIDs[id]; ok {
++			return true
++		}
++	}
++	return false
 +}
 +
  // OverloadDecls returns the overload declarations in the order in which they were declared.

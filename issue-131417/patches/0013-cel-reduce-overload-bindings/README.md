@@ -51,39 +51,48 @@ if a.IsChecked() && len(refMap) != 0 {
 |---|---|---|---|
 | Folder | [`patch-a/`](patch-a/) | [`patch-b/`](patch-b/) | [`patch-c/`](patch-c/) |
 | Files changed | `program.go`, `decls.go` | `program.go`, `env.go` | `program.go`, `checker.go` |
-| Per-program hot path | O(F × U) ≈ O(3 140) | O(R × O) ≈ O(20–90) | O(R) ≈ O(8–30) |
+| Per-program hot path | O(F × K) ≈ O(630) | O(R × O) ≈ O(20–90) | O(R) ≈ O(8–30) |
 | Env overhead | none | ~5.5 KB (index, once) | none |
 | `e.functions` loop | kept (skips non-matching) | eliminated | eliminated |
 | External API change | no | no | no |
 | Status | ready | ready | ready |
 
+> **K** = avg overloads per function ≈ 1–4 (constant). Patch A iterates `fn.overloads`
+> (the smaller side) and probes `usedOIDs` — not the reverse. See Patch A section below.
+
 ---
 
-### Patch A — inline `usedOIDs` set in `newProgram`
+### Patch A — inline `usedOIDs` set + `OverlapsOIDs` on `FunctionDecl`
 
 **Folder:** [`patch-a/`](patch-a/)
 **Files:** `cel/program.go`, `common/decls/decls.go`
 
 Builds a `usedOIDs map[string]struct{}` from `refMap` inside `newProgram`,
-then iterates `e.functions`. For each function a new helper `fnOverlapsOIDs`
-calls `fn.HasOverloadID(oID)` — a direct O(1) lookup into the unexported
-`overloads` map — for every entry in `usedOIDs`. Functions with no overlap
-are skipped entirely.
+then iterates `e.functions`. For each function a new `OverlapsOIDs` method on
+`FunctionDecl` performs the intersection check by iterating `f.overloads` (the
+**smaller, constant side** — typically 1–4 entries) and probing `usedOIDs`
+(up to ~20 entries) for each. Functions with no overlap are skipped entirely.
 
-`HasOverloadID` is the only addition to `decls.go`; it avoids the
-`[]*OverloadDecl` slice allocation that `OverloadDecls()` would otherwise
-perform on every call.
+The correct direction: always iterate the smaller set, probe the larger one.
 
 ```
 newProgram (checked path):
-  1. usedOIDs ← flatten refMap         O(R × O) ≈ O(20)
-  2. for fn in e.functions:            O(F) = O(157)
-       if fnOverlapsOIDs(fn, usedOIDs) O(|usedOIDs|) × O(1) per ID
-         fn.Bindings() + disp.Add()
+  1. usedOIDs ← flatten refMap          O(R × O) ≈ O(20)
+  2. for fn in e.functions:             O(F) = O(157)
+       fn.OverlapsOIDs(usedOIDs)        O(|fn.overloads|) ≈ O(1–4)  ← smaller side
+         → if true: fn.Bindings() + disp.Add()
+
+// decls.go — iterates f.overloads, probes usedOIDs
+func (f *FunctionDecl) OverlapsOIDs(set map[string]struct{}) bool {
+    for id := range f.overloads { if _, ok := set[id]; ok { return true } }
+    return false
+}
 ```
 
-**Trade-offs:** simplest change, no new fields on any struct, but still
-iterates all 157 functions per program.
+**Trade-offs:** simplest change, no new fields on any struct. Still iterates
+all 157 functions but the per-function check is O(K) ≈ O(1–4) instead of
+O(U) ≈ O(20) — roughly **5× faster** inner loop vs iterating the wrong side.
+Total: O(F × K) ≈ O(630) vs O(F × U) ≈ O(3 140) before the fix.
 
 **See:** [`patch-a/README.md`](patch-a/README.md)
 
