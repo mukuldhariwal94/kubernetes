@@ -193,38 +193,47 @@ func newProgram(e *Env, a *ast.AST, opts []ProgramOption) (Program, error) {
 		}
 	}
 
-	// Unchecked AST or empty ref-map: add all function bindings as before.
-	e.funcBindOnce.Do(func() {
-		var bindings []*functions.Overload
-		e.functionBindings = []*functions.Overload{}
+	if a.IsChecked() {
+		// overwrite incase unchecked again.
 		refMap := a.ReferenceMap()
-		usedOIDs := make(map[string]struct{}, len(refMap))
-
-		if a.IsChecked() && len(refMap) != 0 {
-			fmt.Println("my new solution is here", refMap)
-			for _, r := range refMap {
-				for _, oID := range r.OverloadIDs {
-					usedOIDs[oID] = struct{}{}
-				}
+		usedOIDs := make(map[string]struct{})
+		for _, ref := range refMap {
+			for _, oID := range ref.OverloadIDs {
+				usedOIDs[oID] = struct{}{}
 			}
 		}
-
+		var progBindings []*functions.Overload
+		// local, not e.functionBindings
 		for _, fn := range e.functions {
 			if len(usedOIDs) > 0 && !fn.OverlapsOIDs(usedOIDs) {
 				continue
 			}
-			bindings, err = fn.Bindings()
+			bindings, err := fn.Bindings()
 			if err != nil {
-				return
+				return nil, err
 			}
-			e.functionBindings = append(e.functionBindings, bindings...)
+			progBindings = append(progBindings, bindings...)
 		}
-	})
-	if err != nil {
-		return nil, err
-	}
-	if err = disp.Add(e.functionBindings...); err != nil {
-		return nil, err
+		if err := disp.Add(progBindings...); err != nil {
+			return nil, err
+		}
+	} else {
+		e.funcBindOnce.Do(func() {
+			var bindings []*functions.Overload
+			e.functionBindings = []*functions.Overload{}
+			for _, fn := range e.functions {
+				bindings, err = fn.Bindings()
+				if err != nil {
+					return
+				}
+				e.functionBindings = append(e.functionBindings, bindings...)
+			}
+		})
+		// Add the function bindings created via Function() options.
+		err = disp.Add(e.functionBindings...)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	// Set the attribute factory after the options have been set.
