@@ -270,7 +270,7 @@ func (f *FunctionDecl) AddOverload(overload *OverloadDecl) error {
 		if oID == overload.ID() {
 			if o.SignatureEquals(overload) && o.IsNonStrict() == overload.IsNonStrict() {
 				// Allow redefinition of an overload implementation so long as the signatures match.
-				if overload.hasBinding() {
+				if overload.HasBinding() {
 					f.overloads[oID] = overload
 				}
 				// Allow redefinition of the doc string.
@@ -290,6 +290,23 @@ func (f *FunctionDecl) AddOverload(overload *OverloadDecl) error {
 	return nil
 }
 
+// OverlapsOIDs reports whether any overload declared by this function appears
+// in usedOIDs. It iterates f.overloads (typically 1–4 entries — the smaller,
+// constant side of the intersection) and performs one O(1) lookup into
+// usedOIDs per entry, which is cheaper than iterating usedOIDs (up to ~20
+// entries) and probing f.overloads for each.
+func (f *FunctionDecl) OverlapsOIDs(usedOIDs map[string]struct{}) bool {
+	if f == nil {
+		return false
+	}
+	for id := range f.overloads {
+		if _, ok := usedOIDs[id]; ok {
+			return true
+		}
+	}
+	return false
+}
+
 // OverloadDecls returns the overload declarations in the order in which they were declared.
 func (f *FunctionDecl) OverloadDecls() []*OverloadDecl {
 	var emptySet []*OverloadDecl
@@ -301,6 +318,14 @@ func (f *FunctionDecl) OverloadDecls() []*OverloadDecl {
 		overloads = append(overloads, f.overloads[oID])
 	}
 	return overloads
+}
+
+// HasSingletonBinding indicates whether the function has a singleton binding definition.
+func (f *FunctionDecl) HasSingletonBinding() bool {
+	if f == nil {
+		return false
+	}
+	return f.singleton != nil
 }
 
 // HasLateBinding returns true if the function has late bindings. A function cannot mix late bindings with other bindings.
@@ -328,7 +353,7 @@ func (f *FunctionDecl) Bindings() ([]*functions.Overload, error) {
 	for _, oID := range f.overloadOrdinals {
 		o := f.overloads[oID]
 		hasLateBinding = hasLateBinding || o.HasLateBinding()
-		if o.hasBinding() {
+		if o.HasBinding() {
 			overload := &functions.Overload{
 				Operator:     o.ID(),
 				Unary:        o.guardedUnaryOp(f.Name(), f.disableTypeGuards),
@@ -740,8 +765,8 @@ func (o *OverloadDecl) SignatureOverlaps(other *OverloadDecl) bool {
 	return argsOverlap
 }
 
-// hasBinding indicates whether the overload already has a definition.
-func (o *OverloadDecl) hasBinding() bool {
+// HasBinding indicates whether the overload already has a definition.
+func (o *OverloadDecl) HasBinding() bool {
 	return o != nil && (o.unaryOp != nil || o.binaryOp != nil || o.functionOp != nil)
 }
 
@@ -842,7 +867,7 @@ func OverloadExamples(examples ...string) OverloadOpt {
 // type-guard which ensures runtime type agreement between the overload signature and runtime argument types.
 func UnaryBinding(binding functions.UnaryOp) OverloadOpt {
 	return func(o *OverloadDecl) (*OverloadDecl, error) {
-		if o.hasBinding() {
+		if o.HasBinding() {
 			return nil, fmt.Errorf("overload already has a binding: %s", o.ID())
 		}
 		if len(o.ArgTypes()) != 1 {
@@ -860,7 +885,7 @@ func UnaryBinding(binding functions.UnaryOp) OverloadOpt {
 // type-guard which ensures runtime type agreement between the overload signature and runtime argument types.
 func BinaryBinding(binding functions.BinaryOp) OverloadOpt {
 	return func(o *OverloadDecl) (*OverloadDecl, error) {
-		if o.hasBinding() {
+		if o.HasBinding() {
 			return nil, fmt.Errorf("overload already has a binding: %s", o.ID())
 		}
 		if len(o.ArgTypes()) != 2 {
@@ -878,7 +903,7 @@ func BinaryBinding(binding functions.BinaryOp) OverloadOpt {
 // type-guard which ensures runtime type agreement between the overload signature and runtime argument types.
 func FunctionBinding(binding functions.FunctionOp) OverloadOpt {
 	return func(o *OverloadDecl) (*OverloadDecl, error) {
-		if o.hasBinding() {
+		if o.HasBinding() {
 			return nil, fmt.Errorf("overload already has a binding: %s", o.ID())
 		}
 		if o.hasLateBinding {
@@ -893,7 +918,7 @@ func FunctionBinding(binding functions.FunctionOp) OverloadOpt {
 // This is useful for functions which have side-effects or are not deterministically computable.
 func LateFunctionBinding() OverloadOpt {
 	return func(o *OverloadDecl) (*OverloadDecl, error) {
-		if o.hasBinding() {
+		if o.HasBinding() {
 			return nil, fmt.Errorf("overload already has a binding: %s", o.ID())
 		}
 		o.hasLateBinding = true
